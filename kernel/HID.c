@@ -186,6 +186,8 @@ static s32 DS4GetInputSync(void)
 
 static u8 *DS4Big = NULL;
 static u16 DS4CtrlIface = 3;
+static u32 DS4WdTimer = 0;
+static u32 DS4WdCount = 0;
 static s32 DS4Ctrl(u8 reqtype, u8 req, u16 value, u16 len, u8 *data)
 {
 	struct _usb_msg *msg = &ds4_sync_req;
@@ -401,7 +403,7 @@ s32 HIDOpen( u32 LoaderRequest )
 				DS4Iface = 0;
 				DS4Active = 0;
 				DS4Reads = 0;
-				dbgprintf("PADTEST v8 VID:%04X PID:%04X ep=%02X size=%u\r\n", DeviceVID, DevicePID, bEndpointAddress, wMaxPacketSize);
+				dbgprintf("PADTEST v9 VID:%04X PID:%04X ep=%02X size=%u\r\n", DeviceVID, DevicePID, bEndpointAddress, wMaxPacketSize);
 				if( DeviceVID == 0x2dc8 )
 					GenericWakeSequence();
 				if( DeviceVID == 0x054c && DevicePID == 0x09cc )
@@ -419,13 +421,15 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST v8 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v9 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
 					sync_before_read(DS4Feat, 64);
 					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 						DS4Feat[0], DS4Feat[1], DS4Feat[2], DS4Feat[3], DS4Feat[4], DS4Feat[5], DS4Feat[6], DS4Feat[7]);
 					if(DS4Buf == NULL) DS4Buf = (u8*)malloca(64, 32);
 					DS4WakeSequence();
+					DS4WdTimer = read32(HW_TIMER);
+					DS4WdCount = 0;
 					DS4Sync = 0;
 					DS4SyncReads = 0;
 					DS4SyncTimer = 0;
@@ -1061,7 +1065,7 @@ void HIDIRQRead()
 	{
 		DS4Reads++;
 		sync_before_read(Packet, 32);
-		if(DS4Reads <= 8 || (DS4LastRet < 0 && DS4Reads <= 40) || (DS4Reads % 250) == 0)
+		if(DS4Reads <= 8 || (DS4LastRet < 0 && DS4Reads <= 40))
 			dbgprintf("PADTEST:read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 				DS4Reads, DS4LastRet, Packet[0], Packet[1], Packet[2], Packet[3], Packet[4],
 				Packet[5], Packet[6], Packet[7], Packet[8], Packet[9], Packet[10], Packet[11]);
@@ -1281,6 +1285,13 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 {
 	if(TimerDiffTicks(HID_Timer) > 3800)	// about 500 times a second
 	{
+		if(DS4Active && hidattached && DS4Reads == 0 && DS4WdCount < 10 && TimerDiffTicks(DS4WdTimer) > 3800000)	// no data after ~2 seconds
+		{
+			DS4WdCount++;
+			dbgprintf("DS4TEST:watchdog retry %u\r\n", DS4WdCount);
+			DS4WakeSequence();
+			DS4WdTimer = read32(HW_TIMER);
+		}
 		if(DS4IntrDone && DS4Fd >= 0)
 		{
 			DS4IntrDone = 0;
