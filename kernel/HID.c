@@ -28,11 +28,19 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-#ifndef DEBUG_HID
-#define dbgprintf(...)
-#else
+//DS4v2 TEST: HID log always on
 extern int dbgprintf( const char *fmt, ...);
-#endif
+
+//DS4v2 TEST: diagnostic state
+static u32 DS4Iface = 0;
+static u32 DS4Active = 0;
+static volatile s32 DS4LastRet = 0x7FFFFFFF;
+static u32 DS4Reads = 0;
+static u32 DS4Timer = 0;
+static u32 DS4StatusCount = 0;
+static u32 DS4OrigClass = 0, DS4OrigEP = 0, DS4OrigEPOut = 0, DS4OrigSize = 0;
+static s32 DS4FeatRet = 0x7FFFFFFF;
+static u8 *DS4Feat = NULL;
 
 static u8 *kb_input = (u8*)0x13026C60;
 
@@ -265,6 +273,32 @@ s32 HIDOpen( u32 LoaderRequest )
 
 				ControllerID = DeviceID;
 				bEndpointAddressController = bEndpointAddress;
+				DS4Iface = 0;
+				DS4Active = 0;
+				if( DeviceVID == 0x054c && DevicePID == 0x09cc )
+				{
+					DS4Active = 1;
+					DS4Iface = 3;
+					DS4Reads = 0;
+					DS4Timer = 0;
+					DS4StatusCount = 0;
+					DS4OrigClass = bInterfaceClass;
+					DS4OrigEP = bEndpointAddress;
+					DS4OrigEPOut = bEndpointAddressOut;
+					DS4OrigSize = wMaxPacketSize;
+					if( bEndpointAddress != 0x84 )
+					{
+						bEndpointAddressController = 0x84;
+						bEndpointAddressOut = 0x03;
+						wMaxPacketSize = 64;
+					}
+					if(DS4Feat == NULL) DS4Feat = (u8*)malloca(64, 32);
+					memset32(DS4Feat, 0, 64);
+					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
+						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
+					dbgprintf("DS4TEST:open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
+				}
 
 				if( DeviceVID == 0x054c && DevicePID == 0x0268 )
 				{
@@ -650,6 +684,8 @@ static u32 HIDAlarm()
 	while(1)
 	{
 		mqueue_recv(hidqueue, &msg, 0);
+		if(msg == hidreadcontrollermsg)
+			DS4LastRet = (s32)msg->result;
 		mqueue_ack(msg, 0);
 		if(msg == hidreadcontrollermsg)
 			hidread = 1;
@@ -682,7 +718,7 @@ static s32 HIDControlMessage(u32 isKBreq, u8 *Data, u32 Length, u32 RequestType,
 	msg->ctrl.bmRequestType = RequestType;
 	msg->ctrl.bmRequest = Request;
 	msg->ctrl.wValue = Value;
-	msg->ctrl.wIndex = 0;
+	msg->ctrl.wIndex = isKBreq ? 0 : DS4Iface;
 	msg->ctrl.wLength = Length;
 	msg->ctrl.rpData = Data;
 
@@ -829,6 +865,16 @@ ctrlrumblerepeat:
 void HIDIRQRead()
 {
 	u8 controllerNumber;
+
+	if(DS4Active)
+	{
+		DS4Reads++;
+		sync_before_read(Packet, 32);
+		if(DS4Reads <= 20 || (DS4Reads % 500) == 0)
+			dbgprintf("DS4TEST:read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+				DS4Reads, DS4LastRet, Packet[0], Packet[1], Packet[2], Packet[3], Packet[4],
+				Packet[5], Packet[6], Packet[7], Packet[8], Packet[9]);
+	}
 
 	switch( HID_CTRL->MultiIn )
 	{
@@ -1044,6 +1090,16 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 {
 	if(TimerDiffTicks(HID_Timer) > 3800)	// about 500 times a second
 	{
+		if(!LoaderRequest && DS4Active)
+		{
+			if(DS4StatusCount < 20 && (DS4Timer == 0 || TimerDiffTicks(DS4Timer) > 5700000))	// about every 3 seconds
+			{
+				DS4Timer = read32(HW_TIMER);
+				DS4StatusCount++;
+				dbgprintf("DS4TEST:status class=%02X ep=%02X epout=%02X size=%u feat02=%d reads=%u lastret=%d attached=%u\r\n",
+					DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet, DS4Reads, DS4LastRet, hidattached);
+			}
+		}
 		if(hidchange == 1)
 		{
 			hidattached = 0;
