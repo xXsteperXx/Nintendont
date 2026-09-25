@@ -41,6 +41,11 @@ static u32 DS4StatusCount = 0;
 static u32 DS4OrigClass = 0, DS4OrigEP = 0, DS4OrigEPOut = 0, DS4OrigSize = 0;
 static s32 DS4FeatRet = 0x7FFFFFFF;
 static u8 *DS4Feat = NULL;
+static u32 DS4Sync = 0;
+static u32 DS4SyncTimer = 0;
+static u32 DS4SyncReads = 0;
+static u8 *DS4Buf = NULL;
+struct _usb_msg ds4_sync_req ALIGNED(32);
 void HIDDS4Read();
 
 static u8 *kb_input = (u8*)0x13026C60;
@@ -147,6 +152,26 @@ void HIDInit( void )
 
 	mdelay(100);
 	HID_Timer = read32(HW_TIMER);
+}
+
+static s32 DS4GetInputSync(void)
+{
+	struct _usb_msg *msg = &ds4_sync_req;
+	memset32(msg, 0, sizeof(struct _usb_msg));
+	msg->fd = ControllerID;
+	msg->ctrl.bmRequestType = USB_REQTYPE_INTERFACE_GET;
+	msg->ctrl.bmRequest = USB_REQ_GETREPORT;
+	msg->ctrl.wValue = (USB_REPTYPE_INPUT<<8) | 0x1;
+	msg->ctrl.wIndex = DS4Iface;
+	msg->ctrl.wLength = 64;
+	msg->ctrl.rpData = DS4Buf;
+	msg->vec[0].data = msg;
+	msg->vec[0].len = 64;
+	msg->vec[1].data = DS4Buf;
+	msg->vec[1].len = 64;
+	s32 r = IOS_Ioctlv(HIDHandle, ControlMessage, 1, 1, msg->vec);
+	sync_before_read(DS4Buf, 64);
+	return r;
 }
 
 s32 HIDOpen( u32 LoaderRequest )
@@ -291,8 +316,27 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST:open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v3 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
+					sync_before_read(DS4Feat, 64);
+					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+						DS4Feat[0], DS4Feat[1], DS4Feat[2], DS4Feat[3], DS4Feat[4], DS4Feat[5], DS4Feat[6], DS4Feat[7]);
+					if(DS4Buf == NULL) DS4Buf = (u8*)malloca(64, 32);
+					DS4Sync = 0;
+					DS4SyncReads = 0;
+					DS4SyncTimer = 0;
+					u32 t;
+					for(t = 0; t < 3; ++t)
+					{
+						memset32(DS4Buf, 0, 64);
+						sync_after_write(DS4Buf, 64);
+						s32 r = DS4GetInputSync();
+						dbgprintf("DS4TEST:syncinput try=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+							t, r, DS4Buf[0], DS4Buf[1], DS4Buf[2], DS4Buf[3], DS4Buf[4], DS4Buf[5], DS4Buf[6], DS4Buf[7], DS4Buf[8], DS4Buf[9]);
+						if(r > 0 && DS4Buf[0] == 0x01) DS4Sync = 1;
+						mdelay(5);
+					}
+					dbgprintf("DS4TEST:syncmode=%u\r\n", DS4Sync);
 				}
 
 				if( DeviceVID == 0x054c && DevicePID == 0x0268 )
@@ -626,6 +670,11 @@ s32 HIDOpen( u32 LoaderRequest )
 						HIDRumble = HIDPS3Rumble;
 				}
 
+				if(DS4Active)
+				{
+					RumbleEnabled = 0;
+					HIDRumble = NULL;
+				}
 				HIDControllerConnected = 1;
 				if(HIDKeyboardConnected)
 					break;
@@ -647,8 +696,14 @@ s32 HIDOpen( u32 LoaderRequest )
 		write32(HID_STATUS, 1);
 		sync_after_write((void*)HID_STATUS, 0x20);
 		if(DS4Active)
-			HIDControlMessage(0, Packet, 64, USB_REQTYPE_INTERFACE_GET,
-				USB_REQ_GETREPORT, (USB_REPTYPE_INPUT<<8) | 0x1, hidqueue, hidreadcontrollermsg);
+		{
+			if(!DS4Sync)
+			{
+				s32 sr = HIDControlMessage(0, Packet, 64, USB_REQTYPE_INTERFACE_GET,
+					USB_REQ_GETREPORT, (USB_REPTYPE_INPUT<<8) | 0x1, hidqueue, hidreadcontrollermsg);
+				dbgprintf("DS4TEST:async submit ret=%d\r\n", sr);
+			}
+		}
 		else if(HID_CTRL->Polltype)
 			HIDInterruptMessage(0, Packet, wMaxPacketSize, bEndpointAddressController, hidqueue, hidreadcontrollermsg);
 		else
@@ -1104,14 +1159,31 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 {
 	if(TimerDiffTicks(HID_Timer) > 3800)	// about 500 times a second
 	{
+		if(DS4Active && DS4Sync && hidattached && ControllerID != 0)
+		{
+			if(DS4SyncTimer == 0 || TimerDiffTicks(DS4SyncTimer) > 30000)	// about 60 times a second
+			{
+				DS4SyncTimer = read32(HW_TIMER);
+				s32 r = DS4GetInputSync();
+				DS4SyncReads++;
+				if(!LoaderRequest && (DS4SyncReads <= 20 || (DS4SyncReads % 300) == 0))
+					dbgprintf("DS4TEST:poll n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+						DS4SyncReads, r, DS4Buf[0], DS4Buf[1], DS4Buf[2], DS4Buf[3], DS4Buf[4], DS4Buf[5], DS4Buf[6], DS4Buf[7], DS4Buf[8], DS4Buf[9]);
+				if(r > 0 && DS4Buf[0] == 0x01)
+				{
+					memcpy(HID_Packet, DS4Buf, 64);
+					sync_after_write(HID_Packet, 64);
+				}
+			}
+		}
 		if(!LoaderRequest && DS4Active)
 		{
 			if(DS4StatusCount < 20 && (DS4Timer == 0 || TimerDiffTicks(DS4Timer) > 5700000))	// about every 3 seconds
 			{
 				DS4Timer = read32(HW_TIMER);
 				DS4StatusCount++;
-				dbgprintf("DS4TEST:status class=%02X ep=%02X epout=%02X size=%u feat02=%d reads=%u lastret=%d attached=%u\r\n",
-					DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet, DS4Reads, DS4LastRet, hidattached);
+				dbgprintf("DS4TEST:status sync=%u polls=%u class=%02X ep=%02X epout=%02X size=%u feat02=%d reads=%u lastret=%d attached=%u\r\n",
+					DS4Sync, DS4SyncReads, DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet, DS4Reads, DS4LastRet, hidattached);
 			}
 		}
 		if(hidchange == 1)
