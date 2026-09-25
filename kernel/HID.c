@@ -266,31 +266,16 @@ s32 HIDOpen( u32 LoaderRequest )
 
 				ControllerID = DeviceID;
 
-				if (DeviceVID == 0x054C && DevicePID == 0x09CC) {
-                    dbgprintf("HID: Wake up call for clone DS4.\r\n");
-					HIDInterface = 3;
-					bEndpointAddressOut = 0x02;
-                    u8 *ds4_buf = (u8*)malloca(1024, 32);
-
-					// The clone basically checks if we read the HID descriptor and opens itself up for communication.
-					memset32(ds4_buf, 0, 1024);
-                    HIDControlMessage(0, ds4_buf, 535, 0x81, 0x06, 0x2200, 0, NULL);
-
-
-					// We can now use the ds4 controller without any issues.
-					// Lightbar control (using indigo)
-					memset32(ds4_buf, 0, 1024);
-                    ds4_buf[0] = 0x05; // Report ID
-                    ds4_buf[1] = 0x02; // valid_flag0 (0x02 = LED control, 0x01 = rumble)
-                    ds4_buf[6] = 0x80; // Red
-                    ds4_buf[7] = 0x00; // Green
-                    ds4_buf[8] = 0xFF; // Blue
-
-                    // Send to the OUT endpoint
-                    HIDInterruptMessage(0, ds4_buf, 32, bEndpointAddressOut, 0, NULL);
-					free(ds4_buf);
-                }
-				else HIDInterface = 0; // Prevent regression for other HID
+				// DS4 wake-up: nao forca interface nem endpoint (isso era
+				// especifico de clones). Apenas tenta acordar o controle
+				// pedindo o Feature Report 0x02 (calibracao), igual o
+				// driver oficial do Linux faz. Fallback para 0x12.
+				HIDInterface = 0;
+				if( DeviceVID == 0x054c && (DevicePID == 0x05c4 || DevicePID == 0x09cc) )
+				{
+					dbgprintf("HID:DualShock 4 detected, sending wake-up\r\n");
+					HIDPS4Init();
+				}
 				bEndpointAddressController = bEndpointAddress;
 
 				if( DeviceVID == 0x054c && DevicePID == 0x0268 )
@@ -749,6 +734,28 @@ static s32 HIDInterruptMessage(u32 isKBreq, u8 *Data, u32 Length, u32 Endpoint, 
 		return IOS_IoctlvAsync(HIDHandle, InterruptMessage, 2-endpoint_dir, endpoint_dir, msg->vec, asyncqueue, asyncmsg);
 	return IOS_Ioctlv(HIDHandle, InterruptMessage, 2-endpoint_dir, endpoint_dir, msg->vec);
 }
+
+void HIDPS4Init()
+{
+	u8 *buf = (u8*)malloca( 0x40, 32 );
+	u32 i;
+
+	// Tenta acordar o DS4 pedindo o Feature Report 0x02 (calibracao),
+	// igual o driver oficial do Linux faz. Se falhar, tenta 0x12.
+	// Nao trava o boot se falhar - e so uma tentativa de wake-up.
+	u32 reports_to_try[2] = {0x02, 0x12};
+	for(i = 0; i < 2; ++i)
+	{
+		memset32( buf, 0, 0x40 );
+		s32 ret = HIDControlMessage(0, buf, 37, USB_REQTYPE_INTERFACE_GET,
+			USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | reports_to_try[i], 0, NULL);
+		dbgprintf("HID:HIDPS4Init: feature report %02X ret:%d\r\n", reports_to_try[i], ret);
+		if(ret >= 0)
+			break;
+	}
+	free(buf);
+}
+
 void HIDGCInit()
 {
 	// Needed for some adapters clone
