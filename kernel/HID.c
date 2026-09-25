@@ -46,6 +46,16 @@ static u32 DS4SyncTimer = 0;
 static u32 DS4SyncReads = 0;
 static u8 *DS4Buf = NULL;
 struct _usb_msg ds4_sync_req ALIGNED(32);
+static s32 DS4Fd = -1;
+static struct ipcmessage *ds4intrmsg = NULL;
+static vu32 DS4IntrDone = 0;
+static volatile s32 DS4IntrRet = 0x7FFFFFFF;
+static u32 DS4IntrReads = 0;
+static u8 *DS4Ep = NULL;
+static u16 *DS4Len = NULL;
+static u8 *DS4IntrBuf = NULL;
+static ioctlv *DS4Vec = NULL;
+static s32 DS4OpenRet1 = 0x7FFFFFFF, DS4OpenRet2 = 0x7FFFFFFF;
 void HIDDS4Read();
 
 static u8 *kb_input = (u8*)0x13026C60;
@@ -134,7 +144,7 @@ void HIDInit( void )
 	kbbuf = (u8*)malloca( 32,32 );
 
 	hidheap = (u8*)malloca(64,32);
-	hidqueue = mqueue_create(hidheap, 3);
+	hidqueue = mqueue_create(hidheap, 8);
 	hidreadcontrollermsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 	hidreadkeyboardmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 	hidchangemsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
@@ -172,6 +182,22 @@ static s32 DS4GetInputSync(void)
 	s32 r = IOS_Ioctlv(HIDHandle, ControlMessage, 1, 1, msg->vec);
 	sync_before_read(DS4Buf, 64);
 	return r;
+}
+
+static s32 DS4SubmitIntr(void)
+{
+	*DS4Ep = 0x84;
+	*DS4Len = 64;
+	sync_after_write(DS4Ep, 32);
+	sync_after_write(DS4Len, 32);
+	DS4Vec[0].data = DS4Ep;
+	DS4Vec[0].len = 1;
+	DS4Vec[1].data = DS4Len;
+	DS4Vec[1].len = 2;
+	DS4Vec[2].data = DS4IntrBuf;
+	DS4Vec[2].len = 64;
+	sync_after_write(DS4Vec, 32);
+	return IOS_IoctlvAsync(DS4Fd, 2, 2, 1, DS4Vec, hidqueue, ds4intrmsg);
 }
 
 s32 HIDOpen( u32 LoaderRequest )
@@ -316,7 +342,7 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST v3 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v4 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
 					sync_before_read(DS4Feat, 64);
 					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
@@ -325,18 +351,34 @@ s32 HIDOpen( u32 LoaderRequest )
 					DS4Sync = 0;
 					DS4SyncReads = 0;
 					DS4SyncTimer = 0;
-					u32 t;
-					for(t = 0; t < 3; ++t)
+					if(DS4Ep == NULL)
 					{
-						memset32(DS4Buf, 0, 64);
-						sync_after_write(DS4Buf, 64);
-						s32 r = DS4GetInputSync();
-						dbgprintf("DS4TEST:syncinput try=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-							t, r, DS4Buf[0], DS4Buf[1], DS4Buf[2], DS4Buf[3], DS4Buf[4], DS4Buf[5], DS4Buf[6], DS4Buf[7], DS4Buf[8], DS4Buf[9]);
-						if(r > 0 && DS4Buf[0] == 0x01) DS4Sync = 1;
-						mdelay(5);
+						DS4Ep = (u8*)malloca(32, 32);
+						DS4Len = (u16*)malloca(32, 32);
+						DS4IntrBuf = (u8*)malloca(64, 32);
+						DS4Vec = (ioctlv*)malloca(32, 32);
+						ds4intrmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 					}
-					dbgprintf("DS4TEST:syncmode=%u\r\n", DS4Sync);
+					if(DS4Fd < 0)
+					{
+						DS4Fd = IOS_Open("/dev/usb/oh0/54c/9cc", 0);
+						DS4OpenRet1 = DS4Fd;
+						if(DS4Fd < 0)
+						{
+							DS4Fd = IOS_Open("/dev/usb/oh0/054c/09cc", 0);
+							DS4OpenRet2 = DS4Fd;
+						}
+						dbgprintf("DS4TEST:oh0 open1=%d open2=%d\r\n", DS4OpenRet1, DS4OpenRet2);
+						if(DS4Fd >= 0)
+						{
+							DS4IntrDone = 0;
+							DS4IntrReads = 0;
+							memset32(DS4IntrBuf, 0, 64);
+							sync_after_write(DS4IntrBuf, 64);
+							s32 sr = DS4SubmitIntr();
+							dbgprintf("DS4TEST:oh0 submit=%d\r\n", sr);
+						}
+					}
 				}
 
 				if( DeviceVID == 0x054c && DevicePID == 0x0268 )
@@ -741,8 +783,12 @@ static u32 HIDAlarm()
 		mqueue_recv(hidqueue, &msg, 0);
 		if(msg == hidreadcontrollermsg)
 			DS4LastRet = (s32)msg->result;
+		if(ds4intrmsg != NULL && msg == ds4intrmsg)
+			DS4IntrRet = (s32)msg->result;
 		mqueue_ack(msg, 0);
-		if(msg == hidreadcontrollermsg)
+		if(ds4intrmsg != NULL && msg == ds4intrmsg)
+			DS4IntrDone = 1;
+		else if(msg == hidreadcontrollermsg)
 			hidread = 1;
 		else if(msg == hidreadkeyboardmsg)
 			keyboardread = 1;
@@ -1159,6 +1205,23 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 {
 	if(TimerDiffTicks(HID_Timer) > 3800)	// about 500 times a second
 	{
+		if(DS4IntrDone && DS4Fd >= 0)
+		{
+			DS4IntrDone = 0;
+			DS4IntrReads++;
+			sync_before_read(DS4IntrBuf, 64);
+			if(!LoaderRequest && (DS4IntrReads <= 20 || (DS4IntrReads % 500) == 0))
+				dbgprintf("DS4TEST:oh0 read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+					DS4IntrReads, DS4IntrRet, DS4IntrBuf[0], DS4IntrBuf[1], DS4IntrBuf[2], DS4IntrBuf[3], DS4IntrBuf[4],
+					DS4IntrBuf[5], DS4IntrBuf[6], DS4IntrBuf[7], DS4IntrBuf[8], DS4IntrBuf[9]);
+			if(DS4IntrRet > 0 && DS4IntrBuf[0] == 0x01)
+			{
+				memcpy(HID_Packet, DS4IntrBuf, 64);
+				sync_after_write(HID_Packet, 64);
+			}
+			if(DS4IntrRet >= 0 || DS4IntrReads < 50)
+				DS4SubmitIntr();
+		}
 		if(DS4Active && DS4Sync && hidattached && ControllerID != 0)
 		{
 			if(DS4SyncTimer == 0 || TimerDiffTicks(DS4SyncTimer) > 30000)	// about 60 times a second
@@ -1182,8 +1245,8 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 			{
 				DS4Timer = read32(HW_TIMER);
 				DS4StatusCount++;
-				dbgprintf("DS4TEST:status sync=%u polls=%u class=%02X ep=%02X epout=%02X size=%u feat02=%d reads=%u lastret=%d attached=%u\r\n",
-					DS4Sync, DS4SyncReads, DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet, DS4Reads, DS4LastRet, hidattached);
+				dbgprintf("DS4TEST:status oh0fd=%d oh0reads=%u oh0ret=%d class=%02X ep=%02X epout=%02X size=%u feat02=%d reads=%u lastret=%d attached=%u\r\n",
+					DS4Fd, DS4IntrReads, DS4IntrRet, DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet, DS4Reads, DS4LastRet, hidattached);
 			}
 		}
 		if(hidchange == 1)
