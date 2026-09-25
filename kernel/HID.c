@@ -184,6 +184,63 @@ static s32 DS4GetInputSync(void)
 	return r;
 }
 
+static u8 *DS4Big = NULL;
+static s32 DS4Ctrl(u8 reqtype, u8 req, u16 value, u16 len, u8 *data)
+{
+	struct _usb_msg *msg = &ds4_sync_req;
+	u8 dir = !!(reqtype & USB_CTRLTYPE_DIR_DEVICE2HOST);
+	memset32(msg, 0, sizeof(struct _usb_msg));
+	msg->fd = ControllerID;
+	msg->ctrl.bmRequestType = reqtype;
+	msg->ctrl.bmRequest = req;
+	msg->ctrl.wValue = value;
+	msg->ctrl.wIndex = 3;
+	msg->ctrl.wLength = len;
+	msg->ctrl.rpData = data;
+	msg->vec[0].data = msg;
+	msg->vec[0].len = 64;
+	msg->vec[1].data = data;
+	msg->vec[1].len = len;
+	sync_after_write(data, (len + 31) & ~31);
+	s32 r = IOS_Ioctlv(HIDHandle, ControlMessage, 2-dir, dir, msg->vec);
+	if(dir) sync_before_read(data, (len + 31) & ~31);
+	return r;
+}
+
+static void DS4WakeSequence(void)
+{
+	s32 r;
+	if(DS4Big == NULL) DS4Big = (u8*)malloca(544, 32);
+	//1. read HID report descriptor (standard request to interface 3)
+	dbgprintf("DS4TEST:step1 getdesc\r\n");
+	memset32(DS4Big, 0, 544);
+	r = DS4Ctrl(0x81, 0x06, 0x2200, 507, DS4Big);
+	dbgprintf("DS4TEST:step1 ret=%d %02X %02X %02X %02X\r\n", r, DS4Big[0], DS4Big[1], DS4Big[2], DS4Big[3]);
+	//2. SET_IDLE 0
+	dbgprintf("DS4TEST:step2 setidle\r\n");
+	r = DS4Ctrl(0x21, 0x0A, 0x0000, 0, DS4Big);
+	dbgprintf("DS4TEST:step2 ret=%d\r\n", r);
+	//3. feature 0xA3 (firmware info)
+	dbgprintf("DS4TEST:step3 featA3\r\n");
+	memset32(DS4Big, 0, 64);
+	r = DS4Ctrl(0xA1, 0x01, 0x03A3, 49, DS4Big);
+	dbgprintf("DS4TEST:step3 ret=%d %02X %02X %02X %02X\r\n", r, DS4Big[0], DS4Big[1], DS4Big[2], DS4Big[3]);
+	//4. output report 0x05: light bar blue
+	dbgprintf("DS4TEST:step4 led\r\n");
+	memset32(DS4Big, 0, 64);
+	DS4Big[0] = 0x05;
+	DS4Big[1] = 0x07;
+	DS4Big[6] = 0x00;
+	DS4Big[7] = 0x00;
+	DS4Big[8] = 0x40;
+	r = DS4Ctrl(0x21, 0x09, 0x0205, 32, DS4Big);
+	dbgprintf("DS4TEST:step4 ret=%d\r\n", r);
+	//5. SET_INTERFACE 3 alt 0 (standard, interface)
+	dbgprintf("DS4TEST:step5 setinterface\r\n");
+	r = DS4Ctrl(0x01, 0x0B, 0x0000, 0, DS4Big);
+	dbgprintf("DS4TEST:step5 ret=%d\r\n", r);
+}
+
 static s32 DS4SubmitIntr(void)
 {
 	*DS4Ep = 0x84;
@@ -342,12 +399,13 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST v4 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v5 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
 					sync_before_read(DS4Feat, 64);
 					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 						DS4Feat[0], DS4Feat[1], DS4Feat[2], DS4Feat[3], DS4Feat[4], DS4Feat[5], DS4Feat[6], DS4Feat[7]);
 					if(DS4Buf == NULL) DS4Buf = (u8*)malloca(64, 32);
+					DS4WakeSequence();
 					DS4Sync = 0;
 					DS4SyncReads = 0;
 					DS4SyncTimer = 0;
@@ -359,7 +417,7 @@ s32 HIDOpen( u32 LoaderRequest )
 						DS4Vec = (ioctlv*)malloca(32, 32);
 						ds4intrmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 					}
-					if(DS4Fd < 0)
+					if(0)
 					{
 						DS4Fd = IOS_Open("/dev/usb/oh0/54c/9cc", 0);
 						DS4OpenRet1 = DS4Fd;
@@ -692,7 +750,7 @@ s32 HIDOpen( u32 LoaderRequest )
 				else
 					HIDRead = HIDPS3Read;
 				if(DS4Active)
-					HIDRead = HIDDS4Read;
+					HIDRead = HIDIRQRead;
 
 				if((HID_CTRL->VID == 0x057E) && (HID_CTRL->PID == 0x0337))
 				{
@@ -741,9 +799,8 @@ s32 HIDOpen( u32 LoaderRequest )
 		{
 			if(!DS4Sync)
 			{
-				s32 sr = HIDControlMessage(0, Packet, 64, USB_REQTYPE_INTERFACE_GET,
-					USB_REQ_GETREPORT, (USB_REPTYPE_INPUT<<8) | 0x1, hidqueue, hidreadcontrollermsg);
-				dbgprintf("DS4TEST:async submit ret=%d\r\n", sr);
+				s32 sr = HIDInterruptMessage(0, Packet, 64, bEndpointAddressController, hidqueue, hidreadcontrollermsg);
+				dbgprintf("DS4TEST:intr submit ep=%02X ret=%d\r\n", bEndpointAddressController, sr);
 			}
 		}
 		else if(HID_CTRL->Polltype)
