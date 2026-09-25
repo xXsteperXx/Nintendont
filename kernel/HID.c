@@ -190,37 +190,95 @@ s32 HIDOpen( u32 LoaderRequest )
 
 			//BootStatusError(8, 0);
 
+			// O descritor de configuracao comeca no offset 36 (apos Device Descriptor
+			// de 18 bytes + Configuration Descriptor de 9 bytes + padding).
 			u32 Offset = 36;
 
+			// Pula o Device Descriptor
 			u32 DeviceDescLength    = *(vu8*)(HIDHeap+Offset);
 			Offset += (DeviceDescLength+3)&(~3);
 
+			// Le o Configuration Descriptor para saber o total length
 			u32 ConfigurationLength = *(vu8*)(HIDHeap+Offset);
-			Offset += (ConfigurationLength+3)&(~3);
+			// Avanca para depois do Configuration Descriptor
+			Offset += 9;
 
-			u32 InterfaceDescLength = *(vu8*)(HIDHeap+Offset);
+			// Percorre todas as interfaces do descritor de configuracao
+			// ate encontrar a primeira com bInterfaceClass == 0x03 (HID).
+			// No DS4 v2, as interfaces 0/1/2 sao de audio e a interface 3
+			// e a HID. O codigo antigo assumia que a primeira interface era
+			// HID, o que quebrava o DS4 completamente.
+			u32 bInterfaceClass = 0;
+			u32 bInterfaceSubClass = 0;
+			u32 bInterfaceProtocol = 0;
+			u32 bEndpointAddress = 0;
+			u32 EndpointDescLengthO = 0;
+			u32 foundHID = 0;
+			u32 ConfigEnd = 36 + 9 + ConfigurationLength;
 
-			u32 bInterfaceClass = *(vu8*)(HIDHeap+Offset+5);
-			u32 bInterfaceSubClass = *(vu8*)(HIDHeap+Offset+6);
-			u32 bInterfaceProtocol = *(vu8*)(HIDHeap+Offset+7);
+			while(Offset + 2 < ConfigEnd)
+			{
+				u8 bLength = *(vu8*)(HIDHeap+Offset);
+				u8 bDescType = *(vu8*)(HIDHeap+Offset+1);
+
+				if(bLength == 0)
+					break;
+
+				if(bDescType == 0x04) // INTERFACE Descriptor
+				{
+					bInterfaceClass    = *(vu8*)(HIDHeap+Offset+5);
+					bInterfaceSubClass = *(vu8*)(HIDHeap+Offset+6);
+					bInterfaceProtocol = *(vu8*)(HIDHeap+Offset+7);
+
+					dbgprintf("HID:Interface class:%02X sub:%02X proto:%02X\r\n",
+						bInterfaceClass, bInterfaceSubClass, bInterfaceProtocol);
+
+					if(bInterfaceClass == 0x03) // HID
+					{
+						// Encontrou a interface HID. Le o numero dela.
+						HIDInterface = *(vu8*)(HIDHeap+Offset+2);
+						foundHID = 1;
+					}
+					else
+					{
+						foundHID = 0;
+					}
+				}
+				else if(bDescType == 0x05 && foundHID) // ENDPOINT Descriptor
+				{
+					u32 epAddr = *(vu8*)(HIDHeap+Offset+2);
+					u32 epAttr = *(vu8*)(HIDHeap+Offset+3);
+					u16 epSize = *(vu16*)(HIDHeap+Offset+4);
+
+					dbgprintf("HID:Endpoint addr:%02X attr:%02X size:%u\r\n", epAddr, epAttr, epSize);
+
+					// Queremos o endpoint de IN (bit 0x80 setado) do tipo
+					// Interrupt (attr & 0x03 == 0x03).
+					if((epAddr & 0x80) && ((epAttr & 0x03) == 0x03))
+					{
+						bEndpointAddress = epAddr;
+						wMaxPacketSize   = epSize;
+					}
+					// E o endpoint de OUT (bit 0x80 limpo) do tipo Interrupt.
+					else if(!(epAddr & 0x80) && ((epAttr & 0x03) == 0x03))
+					{
+						bEndpointAddressOut = epAddr;
+					}
+				}
+
+				Offset += (bLength + 3) & (~3);
+			}
+
+			if(!foundHID || bEndpointAddress == 0)
+			{
+				dbgprintf("HID:No HID interface found, skipping device\r\n");
+				continue;
+			}
+
 			dbgprintf("HID:bInterfaceClass:%02X\r\n", bInterfaceClass );
 			dbgprintf("HID:bInterfaceSubClass:%02X\r\n", bInterfaceSubClass );
 			dbgprintf("HID:bInterfaceProtocol:%02X\r\n", bInterfaceProtocol );
-
-			Offset += (InterfaceDescLength+3)&(~3);
-
-			u32 EndpointDescLengthO = *(vu8*)(HIDHeap+Offset);
-
-			u32 bEndpointAddress = *(vu8*)(HIDHeap+Offset+2);
-
-			if( (bEndpointAddress & 0xF0) != 0x80 )
-			{
-				bEndpointAddressOut = bEndpointAddress;
-				Offset += (EndpointDescLengthO+3)&(~3);
-			}
-			bEndpointAddress = *(vu8*)(HIDHeap+Offset+2);
-			wMaxPacketSize   = *(vu16*)(HIDHeap+Offset+4);
-
+			dbgprintf("HID:HIDInterface:%u\r\n", HIDInterface );
 			dbgprintf("HID:bEndpointAddress:%02X\r\n", bEndpointAddress );
 			dbgprintf("HID:wMaxPacketSize  :%u\r\n", wMaxPacketSize );
 
@@ -266,17 +324,9 @@ s32 HIDOpen( u32 LoaderRequest )
 
 				ControllerID = DeviceID;
 
-				// DS4 wake-up: nao forca interface nem endpoint.
-				// Apenas tenta acordar o controle com o Output Report
-				// 0x05, que e o comando que o driver oficial do Linux
-				// usa para comunicacao USB com o DS4.
-				HIDInterface = 0;
-				if( DeviceVID == 0x054c && (DevicePID == 0x05c4 || DevicePID == 0x09cc) )
-				{
-					dbgprintf("HID:DualShock 4 detected, sending wake-up\r\n");
-					HIDPS4Init();
-				}
-				bEndpointAddressController = bEndpointAddress;
+				// Nota: HIDInterface ja foi definido durante o parsing do
+				// descritor acima (numero real da interface HID encontrada).
+				// Nao forcar mais HIDInterface = 0.
 
 				if( DeviceVID == 0x054c && DevicePID == 0x0268 )
 				{
@@ -288,6 +338,8 @@ s32 HIDOpen( u32 LoaderRequest )
 				}
 				else if( DeviceVID == 0x057e && DevicePID == 0x0337 )
 					HIDGCInit();
+
+				bEndpointAddressController = bEndpointAddress;
 
 			//Load controller config
 				char *Data = NULL;
@@ -733,24 +785,6 @@ static s32 HIDInterruptMessage(u32 isKBreq, u8 *Data, u32 Length, u32 Endpoint, 
 	if(asyncmsg != NULL)
 		return IOS_IoctlvAsync(HIDHandle, InterruptMessage, 2-endpoint_dir, endpoint_dir, msg->vec, asyncqueue, asyncmsg);
 	return IOS_Ioctlv(HIDHandle, InterruptMessage, 2-endpoint_dir, endpoint_dir, msg->vec);
-}
-
-void HIDPS4Init()
-{
-	u8 *buf = (u8*)malloca( 0x20, 32 );
-	memset32( buf, 0, 0x20 );
-
-	// Report ID 0x05 = Output Report para DS4 via USB.
-	// buf[0] é o Report ID. O resto fica zerado
-	// (sem rumble, sem LED aceso, sem flags ativas).
-	// Isso pode ser o "empurrão" que falta para o controle
-	// sair do modo passivo e começar a enviar Input Reports.
-	buf[0] = 0x05;
-
-	s32 ret = HIDInterruptMessage(0, buf, 32, bEndpointAddressOut, 0, NULL);
-	dbgprintf("HID:HIDPS4Init: output report 0x05 ret:%d\r\n", ret);
-
-	free(buf);
 }
 
 void HIDGCInit()
