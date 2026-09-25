@@ -185,6 +185,7 @@ static s32 DS4GetInputSync(void)
 }
 
 static u8 *DS4Big = NULL;
+static u16 DS4CtrlIface = 3;
 static s32 DS4Ctrl(u8 reqtype, u8 req, u16 value, u16 len, u8 *data)
 {
 	struct _usb_msg *msg = &ds4_sync_req;
@@ -194,7 +195,7 @@ static s32 DS4Ctrl(u8 reqtype, u8 req, u16 value, u16 len, u8 *data)
 	msg->ctrl.bmRequestType = reqtype;
 	msg->ctrl.bmRequest = req;
 	msg->ctrl.wValue = value;
-	msg->ctrl.wIndex = 3;
+	msg->ctrl.wIndex = DS4CtrlIface;
 	msg->ctrl.wLength = len;
 	msg->ctrl.rpData = data;
 	msg->vec[0].data = msg;
@@ -211,6 +212,7 @@ static void DS4WakeSequence(void)
 {
 	s32 r;
 	if(DS4Big == NULL) DS4Big = (u8*)malloca(544, 32);
+	DS4CtrlIface = 3;
 	//1. read HID report descriptor (standard request to interface 3)
 	dbgprintf("DS4TEST:step1 getdesc\r\n");
 	memset32(DS4Big, 0, 544);
@@ -239,6 +241,20 @@ static void DS4WakeSequence(void)
 	dbgprintf("DS4TEST:step5 setinterface\r\n");
 	r = DS4Ctrl(0x01, 0x0B, 0x0000, 0, DS4Big);
 	dbgprintf("DS4TEST:step5 ret=%d\r\n", r);
+}
+
+static void GenericWakeSequence(void)
+{
+	s32 r;
+	if(DS4Big == NULL) DS4Big = (u8*)malloca(544, 32);
+	DS4CtrlIface = 0;
+	dbgprintf("PADTEST:wake getdesc\r\n");
+	memset32(DS4Big, 0, 544);
+	r = DS4Ctrl(0x81, 0x06, 0x2200, 256, DS4Big);
+	dbgprintf("PADTEST:wake getdesc ret=%d %02X %02X %02X %02X\r\n", r, DS4Big[0], DS4Big[1], DS4Big[2], DS4Big[3]);
+	dbgprintf("PADTEST:wake setidle\r\n");
+	r = DS4Ctrl(0x21, 0x0A, 0x0000, 0, DS4Big);
+	dbgprintf("PADTEST:wake setidle ret=%d\r\n", r);
 }
 
 static s32 DS4SubmitIntr(void)
@@ -385,7 +401,9 @@ s32 HIDOpen( u32 LoaderRequest )
 				DS4Iface = 0;
 				DS4Active = 0;
 				DS4Reads = 0;
-				dbgprintf("PADTEST v7 VID:%04X PID:%04X ep=%02X size=%u\r\n", DeviceVID, DevicePID, bEndpointAddress, wMaxPacketSize);
+				dbgprintf("PADTEST v8 VID:%04X PID:%04X ep=%02X size=%u\r\n", DeviceVID, DevicePID, bEndpointAddress, wMaxPacketSize);
+				if( DeviceVID == 0x2dc8 )
+					GenericWakeSequence();
 				if( DeviceVID == 0x054c && DevicePID == 0x09cc )
 				{
 					DS4Active = 1;
@@ -401,7 +419,7 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST v7 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v8 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
 					sync_before_read(DS4Feat, 64);
 					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
@@ -1043,7 +1061,7 @@ void HIDIRQRead()
 	{
 		DS4Reads++;
 		sync_before_read(Packet, 32);
-		if(DS4Reads <= 8)
+		if(DS4Reads <= 8 || (DS4LastRet < 0 && DS4Reads <= 40) || (DS4Reads % 250) == 0)
 			dbgprintf("PADTEST:read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 				DS4Reads, DS4LastRet, Packet[0], Packet[1], Packet[2], Packet[3], Packet[4],
 				Packet[5], Packet[6], Packet[7], Packet[8], Packet[9], Packet[10], Packet[11]);
