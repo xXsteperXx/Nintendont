@@ -41,6 +41,7 @@ static u32 DS4StatusCount = 0;
 static u32 DS4OrigClass = 0, DS4OrigEP = 0, DS4OrigEPOut = 0, DS4OrigSize = 0;
 static s32 DS4FeatRet = 0x7FFFFFFF;
 static u8 *DS4Feat = NULL;
+void HIDDS4Read();
 
 static u8 *kb_input = (u8*)0x13026C60;
 
@@ -286,12 +287,6 @@ s32 HIDOpen( u32 LoaderRequest )
 					DS4OrigEP = bEndpointAddress;
 					DS4OrigEPOut = bEndpointAddressOut;
 					DS4OrigSize = wMaxPacketSize;
-					if( bEndpointAddress != 0x84 )
-					{
-						bEndpointAddressController = 0x84;
-						bEndpointAddressOut = 0x03;
-						wMaxPacketSize = 64;
-					}
 					if(DS4Feat == NULL) DS4Feat = (u8*)malloca(64, 32);
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
@@ -610,6 +605,8 @@ s32 HIDOpen( u32 LoaderRequest )
 					HIDRead = HIDIRQRead;
 				else
 					HIDRead = HIDPS3Read;
+				if(DS4Active)
+					HIDRead = HIDDS4Read;
 
 				if((HID_CTRL->VID == 0x057E) && (HID_CTRL->PID == 0x0337))
 				{
@@ -649,7 +646,10 @@ s32 HIDOpen( u32 LoaderRequest )
 		memset32((void*)HID_STATUS, 0, 0x20);
 		write32(HID_STATUS, 1);
 		sync_after_write((void*)HID_STATUS, 0x20);
-		if(HID_CTRL->Polltype)
+		if(DS4Active)
+			HIDControlMessage(0, Packet, 64, USB_REQTYPE_INTERFACE_GET,
+				USB_REQ_GETREPORT, (USB_REPTYPE_INPUT<<8) | 0x1, hidqueue, hidreadcontrollermsg);
+		else if(HID_CTRL->Polltype)
 			HIDInterruptMessage(0, Packet, wMaxPacketSize, bEndpointAddressController, hidqueue, hidreadcontrollermsg);
 		else
 		{
@@ -860,6 +860,20 @@ ctrlrumblerepeat:
 		buf += RumbleTransferLen;
 		goto ctrlrumblerepeat;
 	}
+}
+
+void HIDDS4Read()
+{
+	sync_before_read(Packet, 64);
+	DS4Reads++;
+	if(DS4Reads <= 20 || (DS4Reads % 500) == 0)
+		dbgprintf("DS4TEST:ctrlread n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+			DS4Reads, DS4LastRet, Packet[0], Packet[1], Packet[2], Packet[3], Packet[4],
+			Packet[5], Packet[6], Packet[7], Packet[8], Packet[9]);
+	memcpy(HID_Packet, Packet, 64);
+	sync_after_write(HID_Packet, 64);
+	HIDControlMessage(0, Packet, 64, USB_REQTYPE_INTERFACE_GET,
+		USB_REQ_GETREPORT, (USB_REPTYPE_INPUT<<8) | 0x1, hidqueue, hidreadcontrollermsg);
 }
 
 void HIDIRQRead()
