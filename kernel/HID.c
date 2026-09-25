@@ -266,10 +266,10 @@ s32 HIDOpen( u32 LoaderRequest )
 
 				ControllerID = DeviceID;
 
-				// DS4 wake-up: nao forca interface nem endpoint (isso era
-				// especifico de clones). Apenas tenta acordar o controle
-				// pedindo o Feature Report 0x02 (calibracao), igual o
-				// driver oficial do Linux faz. Fallback para 0x12.
+				// DS4 wake-up: nao forca interface nem endpoint.
+				// Apenas tenta acordar o controle com o Output Report
+				// 0x05, que e o comando que o driver oficial do Linux
+				// usa para comunicacao USB com o DS4.
 				HIDInterface = 0;
 				if( DeviceVID == 0x054c && (DevicePID == 0x05c4 || DevicePID == 0x09cc) )
 				{
@@ -737,22 +737,19 @@ static s32 HIDInterruptMessage(u32 isKBreq, u8 *Data, u32 Length, u32 Endpoint, 
 
 void HIDPS4Init()
 {
-	u8 *buf = (u8*)malloca( 0x40, 32 );
-	u32 i;
+	u8 *buf = (u8*)malloca( 0x20, 32 );
+	memset32( buf, 0, 0x20 );
 
-	// Tenta acordar o DS4 pedindo o Feature Report 0x02 (calibracao),
-	// igual o driver oficial do Linux faz. Se falhar, tenta 0x12.
-	// Nao trava o boot se falhar - e so uma tentativa de wake-up.
-	u32 reports_to_try[2] = {0x02, 0x12};
-	for(i = 0; i < 2; ++i)
-	{
-		memset32( buf, 0, 0x40 );
-		s32 ret = HIDControlMessage(0, buf, 37, USB_REQTYPE_INTERFACE_GET,
-			USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | reports_to_try[i], 0, NULL);
-		dbgprintf("HID:HIDPS4Init: feature report %02X ret:%d\r\n", reports_to_try[i], ret);
-		if(ret >= 0)
-			break;
-	}
+	// Report ID 0x05 = Output Report para DS4 via USB.
+	// buf[0] é o Report ID. O resto fica zerado
+	// (sem rumble, sem LED aceso, sem flags ativas).
+	// Isso pode ser o "empurrão" que falta para o controle
+	// sair do modo passivo e começar a enviar Input Reports.
+	buf[0] = 0x05;
+
+	s32 ret = HIDInterruptMessage(0, buf, 32, bEndpointAddressOut, 0, NULL);
+	dbgprintf("HID:HIDPS4Init: output report 0x05 ret:%d\r\n", ret);
+
 	free(buf);
 }
 
