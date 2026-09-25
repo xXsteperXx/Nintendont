@@ -229,7 +229,7 @@ static void DS4WakeSequence(void)
 	dbgprintf("DS4TEST:step4 led\r\n");
 	memset32(DS4Big, 0, 64);
 	DS4Big[0] = 0x05;
-	DS4Big[1] = 0x07;
+	DS4Big[1] = 0x02;
 	DS4Big[6] = 0x00;
 	DS4Big[7] = 0x00;
 	DS4Big[8] = 0x40;
@@ -399,7 +399,7 @@ s32 HIDOpen( u32 LoaderRequest )
 					memset32(DS4Feat, 0, 64);
 					DS4FeatRet = HIDControlMessage(0, DS4Feat, 37, USB_REQTYPE_INTERFACE_GET,
 						USB_REQ_GETREPORT, (USB_REPTYPE_FEATURE<<8) | 0x02, 0, NULL);
-					dbgprintf("DS4TEST v5 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
+					dbgprintf("DS4TEST v6 open class=%02X ep=%02X epout=%02X size=%u feat02=%d\r\n",
 						DS4OrigClass, DS4OrigEP, DS4OrigEPOut, DS4OrigSize, DS4FeatRet);
 					sync_before_read(DS4Feat, 64);
 					dbgprintf("DS4TEST:feat %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
@@ -1042,7 +1042,7 @@ void HIDIRQRead()
 	{
 		DS4Reads++;
 		sync_before_read(Packet, 32);
-		if(DS4Reads <= 20 || (DS4Reads % 500) == 0)
+		if(DS4Reads <= 5)
 			dbgprintf("DS4TEST:read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
 				DS4Reads, DS4LastRet, Packet[0], Packet[1], Packet[2], Packet[3], Packet[4],
 				Packet[5], Packet[6], Packet[7], Packet[8], Packet[9]);
@@ -1298,7 +1298,7 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 		}
 		if(!LoaderRequest && DS4Active)
 		{
-			if(DS4StatusCount < 20 && (DS4Timer == 0 || TimerDiffTicks(DS4Timer) > 5700000))	// about every 3 seconds
+			if(DS4StatusCount < 2 && (DS4Timer == 0 || TimerDiffTicks(DS4Timer) > 5700000))	// about every 3 seconds
 			{
 				DS4Timer = read32(HW_TIMER);
 				DS4StatusCount++;
