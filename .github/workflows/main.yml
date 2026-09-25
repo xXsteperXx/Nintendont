@@ -1,0 +1,26 @@
+name: Build Nintendont
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Nintendont
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" \
+            -w /work \
+            devkitpro/devkitppc:20210619 \
+            make
+
+      - name: Upload boot.dol
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nintendont-test
+          path: loader/loader.dol
