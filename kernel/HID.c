@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v18: 2 USB controllers at the same time (Player 1 + Player 2)
+// v19: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -459,7 +459,7 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v18 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v19 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -501,14 +501,15 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 		write32(HID_CHANGE, DeviceVID);
 		write32(HID_CFG_SIZE, DevicePID);
 		sync_after_write((void*)HID_STATUS, 0x20);
-		u32 waited = 0, aborted = 0;
+		u32 aborted = 0;
 		while(1)
 		{
 			sync_before_read((void*)HID_STATUS, 0x20);
 			if(read32(HID_CHANGE) == 0) break;
-			// when the game is already starting (autoboot) nobody answers anymore
+			// the menu can be busy for a while (loading the game list) and answers later,
+			// only when the game is already starting (autoboot) nobody answers anymore
 			sync_before_read((void*)RESET_STATUS, 0x20);
-			if(HIDRetryOpen || read32(RESET_STATUS) == 0x0DEA || ++waited > 200)	//2 seconds
+			if(HIDRetryOpen || read32(RESET_STATUS) == 0x0DEA)
 			{
 				aborted = 1;
 				break;
@@ -1046,8 +1047,10 @@ s32 HIDOpen( u32 LoaderRequest )
 
 void HIDClose()
 {
+	dbgprintf("HIDClose start\r\n");
 	VenClose();
 	IOS_Close(HIDHandle);
+	dbgprintf("HIDClose done\r\n");
 	HIDHandle = -1;
 }
 
@@ -1754,12 +1757,10 @@ static void VenUpdate(u32 LoaderRequest)
 
 static void VenClose(void)
 {
-	if(VenHandle >= 0)
-	{
-		IOS_Ioctl(VenHandle, VEN_SHUTDOWN, NULL, 0, NULL, 0);
-		IOS_Close(VenHandle);
-		VenHandle = -1;
-	}
+	// Nothing to do: after leaving the game IOS is reloaded, which closes
+	// /dev/usb/ven anyway. Shutting it down here could wait forever on the
+	// requests that are still pending (the game froze on exit).
+	dbgprintf("VEN:left open for the IOS reload\r\n");
 }
 
 void HIDPS3Rumble( u32 Enable )
