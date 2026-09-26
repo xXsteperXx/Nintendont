@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v16: 2 USB controllers at the same time (Player 1 + Player 2)
+// v17: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -456,7 +456,7 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v16 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v17 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -1387,41 +1387,19 @@ static void VenRecoveryStep(hid_slot *s)
 {
 	s32 r;
 	u32 id = s->DeviceID;
-	switch(s->VenStage)
+	if(s->VenStage < 1 || s->VenStage > 3)
+		return;
+	// the sequence that made the reports start in the tests
+	dbgprintf("VEN:t=%u retry %u: set configuration + start sequence\r\n", TMS(), s->VenStage);
+	VenCtrlSync(id, 0x00, 0x09, 0x0001, 0x0000, 0);
+	r = VenCancelEndpoint(id, s->EpIn);
+	dbgprintf("VEN:cancel in ret=%d\r\n", r);
+	if(s->EpOut)
 	{
-		case 1:	// clear a possible halt on the IN endpoint
-			dbgprintf("VEN:t=%u STEP 1: clear halt on IN\r\n", TMS());
-			VenCtrlSync(id, 0x02, 0x01, 0x0000, s->EpIn, 0);
-			r = VenCancelEndpoint(id, s->EpIn);
-			dbgprintf("VEN:cancel in ret=%d\r\n", r);
-			break;
-		case 2:	// same order as Windows: SET_CONFIGURATION first, then the start sequence
-			dbgprintf("VEN:t=%u STEP 2: set configuration + start sequence\r\n", TMS());
-			VenCtrlSync(id, 0x00, 0x09, 0x0001, 0x0000, 0);
-			r = VenCancelEndpoint(id, s->EpIn);
-			dbgprintf("VEN:cancel in ret=%d\r\n", r);
-			if(s->EpOut)
-			{
-				r = VenCancelEndpoint(id, s->EpOut);
-				dbgprintf("VEN:cancel out ret=%d\r\n", r);
-			}
-			VenStartSeq(s);
-			break;
-		case 3:	// SET_INTERFACE 0/0 + start sequence
-			dbgprintf("VEN:t=%u STEP 3: set interface + start sequence\r\n", TMS());
-			VenCtrlSync(id, 0x01, 0x0B, 0x0000, 0x0000, 0);
-			r = VenCancelEndpoint(id, s->EpIn);
-			dbgprintf("VEN:cancel in ret=%d\r\n", r);
-			if(s->EpOut)
-			{
-				r = VenCancelEndpoint(id, s->EpOut);
-				dbgprintf("VEN:cancel out ret=%d\r\n", r);
-			}
-			VenStartSeq(s);
-			break;
-		default:
-			break;
+		r = VenCancelEndpoint(id, s->EpOut);
+		dbgprintf("VEN:cancel out ret=%d\r\n", r);
 	}
+	VenStartSeq(s);
 }
 
 static u32 VenOpen(void)
@@ -1535,16 +1513,17 @@ static u32 VenOpen(void)
 		if(!EpIn || Size < VEN_REPORT_SIZE)
 			continue;
 
-		// claim interface 0, alt setting 0 (like the first transfer does in IOS)
-		memset32(io, 0, 0x20);
-		io[0] = id;
-		io[2] = 0;
-		r = IOS_Ioctl(VenHandle, 7, io, 0x20, NULL, 0);
-		dbgprintf("VEN:setalt ret=%d\r\n", r);
-
-		// no SET_CONFIGURATION (IOS already did it), just reset the endpoint state
+		// Tested on the Wii: the dongle only sends reports when SET_CONFIGURATION
+		// comes right before the Windows start sequence (like on a PC).
+		// Then reset both endpoint states in IOS so the data toggles match.
+		VenCtrlSync(id, 0x00, 0x09, 0x0001, 0x0000, 0);
 		r = VenCancelEndpoint(id, EpIn);
-		dbgprintf("VEN:cancel ret=%d\r\n", r);
+		dbgprintf("VEN:cancel in ret=%d\r\n", r);
+		if(EpOut)
+		{
+			r = VenCancelEndpoint(id, EpOut);
+			dbgprintf("VEN:cancel out ret=%d\r\n", r);
+		}
 
 		//same start sequence as Windows (from a USB capture of this dongle):
 		//product string, 3 vendor requests, then 01 03 02 and 02 08 03 on
