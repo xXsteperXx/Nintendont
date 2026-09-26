@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v17: 2 USB controllers at the same time (Player 1 + Player 2)
+// v18: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -109,6 +109,9 @@ static u32 KBPending = 0;
 static u32 bEndpointAddressKeyboard = 0;
 
 static s32 RumbleSlot = -1;
+// set when the loader did not answer a config request (autoboot from
+// USB Loader GX etc.): the controllers are opened again once the game runs
+static u32 HIDRetryOpen = 0;
 static u32 RumbleType = 0;
 static u32 RumbleEnabled = 0;
 static u8 *RawRumbleDataOn = NULL;
@@ -456,7 +459,7 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v17 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v18 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -498,11 +501,28 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 		write32(HID_CHANGE, DeviceVID);
 		write32(HID_CFG_SIZE, DevicePID);
 		sync_after_write((void*)HID_STATUS, 0x20);
+		u32 waited = 0, aborted = 0;
 		while(1)
 		{
 			sync_before_read((void*)HID_STATUS, 0x20);
 			if(read32(HID_CHANGE) == 0) break;
+			// when the game is already starting (autoboot) nobody answers anymore
+			sync_before_read((void*)RESET_STATUS, 0x20);
+			if(HIDRetryOpen || read32(RESET_STATUS) == 0x0DEA || ++waited > 200)	//2 seconds
+			{
+				aborted = 1;
+				break;
+			}
 			mdelay(10);
+		}
+		if(aborted)
+		{
+			dbgprintf("HID:loader did not answer, opening it again in game\r\n");
+			memset32((void*)HID_STATUS, 0, 0x20);
+			sync_after_write((void*)HID_STATUS, 0x20);
+			HIDRetryOpen = 1;
+			s->DeviceID = 0;
+			return 0;
 		}
 		u32 cfgsize = read32(HID_CFG_SIZE);
 		if(cfgsize == 0)
@@ -1961,6 +1981,7 @@ static void KeyboardRead()
 }
 
 vu32 HIDRumbleCurrent = 0, HIDRumbleLast = 0;
+static u32 hidretrylist = 0;
 vu32 MotorCommand = 0x13003020;
 void HIDUpdateRegisters(u32 LoaderRequest)
 {
@@ -1987,6 +2008,21 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 			hidattach = 0;
 			hidattached = 1;
 			HIDOpen(LoaderRequest);
+			if(HIDRetryOpen && LoaderRequest)
+				hidretrylist = 1;	//keep the list, it is opened again in game
+			else
+			{
+				memset32(AttachedDevices, 0, sizeof(usb_device_entry)*32);
+				IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg);
+			}
+		}
+		if(hidretrylist && !LoaderRequest)
+		{
+			//game is running now, the .ini files are read from the SD card
+			hidretrylist = 0;
+			HIDRetryOpen = 0;
+			dbgprintf("HID:opening the controllers again in game\r\n");
+			HIDOpen(0);
 			memset32(AttachedDevices, 0, sizeof(usb_device_entry)*32);
 			IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg);
 		}
