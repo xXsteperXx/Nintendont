@@ -20,6 +20,7 @@ static vu32* const _siReg = (vu32*)0xCD006400;
 static vu32* const MotorCommand = (vu32*)0x93003010;
 static vu32* RESET_STATUS = (vu32*)0xD3003420;
 static vu32* HID_STATUS = (vu32*)0xD3003440;
+static vu32* HID_STATUS2 = (vu32*)0xD3005380; //2nd USB HID controller active
 static vu32* HIDMotor = (vu32*)0x93003020;
 static vu32* PadUsed = (vu32*)0x93003024;
 
@@ -105,6 +106,7 @@ u32 PADRead(u32 calledByGame)
 
 	u32 WiiUGamepadSlot = ((NIN_CFG*)0x93004000)->WiiUGamepadSlot;
 	u32 HIDPad = (*HID_STATUS == 0) ? HID_PAD_NONE : HID_PAD_NOT_SET;
+	u32 HIDPad2 = (*HID_STATUS2 == 0) ? HID_PAD_NONE : HID_PAD_NOT_SET;
 	u32 chan;
 
 	s16 tempStick;
@@ -116,6 +118,7 @@ u32 PADRead(u32 calledByGame)
 	if(calledByGame && *drcAddress && WiiUGamepadSlot != NIN_CFG_MAXPAD)
 	{
 		used |= (1<<WiiUGamepadSlot);
+		HIDPad2 = HID_PAD_NONE; //only 1 USB HID controller on Wii VC
 		if(HIDPad == HID_PAD_NOT_SET)
 		{
 			u32 HIDChan = 0;
@@ -233,6 +236,8 @@ u32 PADRead(u32 calledByGame)
 					*HIDMotor = (MotorCommand[chan]&0x3);
 					HIDPad = chan;
 				}
+				else if(HIDPad2 == HID_PAD_NOT_SET)
+					HIDPad2 = chan;
 				continue;
 			}
 			used |= (1<<chan);
@@ -369,19 +374,33 @@ u32 PADRead(u32 calledByGame)
 			while(_siReg[14] & (1<<31));
 		}
 	}
-	u32 HIDMemPrep = 0;
 	if (HIDPad == HID_PAD_NOT_SET)
 		HIDPad = MaxPads;
+	if (HIDPad2 == HID_PAD_NOT_SET)
+		HIDPad2 = (HIDPad < HID_PAD_NONE) ? (HIDPad + 1) : MaxPads;
 
-	for (chan = HIDPad; (chan < HID_PAD_NONE); (HID_CTRL->MultiIn == 3 || HID_CTRL->MultiIn == 4) ? (++chan) : (chan = HID_PAD_NONE)) // Run once unless MultiIn == 3
+	u32 hidslot;
+	for (hidslot = 0; hidslot < 2; ++hidslot) // 2 USB HID controllers
+	{
+	u32 HIDMemPrep = 0;
+	u32 HIDBase = 0x930050F0;
+	HID_CTRL = (volatile controller*)0x93005000;
+	chan = HIDPad;
+	if (hidslot)
+	{
+		HIDBase = 0x93005300;
+		HID_CTRL = (volatile controller*)0xD3005200; //uncached, always fresh
+		chan = HIDPad2;
+	}
+	for (; (chan < HID_PAD_NONE); (HID_CTRL->MultiIn == 3 || HID_CTRL->MultiIn == 4) ? (++chan) : (chan = HID_PAD_NONE)) // Run once unless MultiIn == 3
 	{
 		if(HIDMemPrep == 0) // first run
 		{
-			HID_Packet = (vu8*)0x930050F0; // reset back to default offset
+			HID_Packet = (vu8*)HIDBase; // reset back to default offset
 			memInvalidate = (u32)HID_Packet; // prepare memory
 			asm volatile("dcbi 0,%0" : : "b"(memInvalidate) : "memory");
 			//invalidate cache block for controllers using more than 0x10 bytes
-			memInvalidate = (u32)HID_Packet+0x10; // prepare memory
+			memInvalidate = (u32)HID_Packet+0x20; // prepare memory
 			asm volatile("dcbi 0,%0; sync" : : "b"(memInvalidate) : "memory");
 			HIDMemPrep = memInvalidate;
 		}
@@ -399,7 +418,7 @@ u32 PADRead(u32 calledByGame)
 
 		if (HID_CTRL->MultiIn == 3)		//multiple controllers connected to a single usb port all in one message
 		{
-			HID_Packet = (vu8*)(0x930050F0 + (chan * HID_CTRL->MultiInValue));	//skip forward how ever many bytes in each controller
+			HID_Packet = (vu8*)(HIDBase + (chan * HID_CTRL->MultiInValue));	//skip forward how ever many bytes in each controller
 			u32 HID_CacheEndBlock = ALIGN32(((u32)HID_Packet) + HID_CTRL->MultiInValue); //calculate upper cache block used
 			if(HID_CacheEndBlock > HIDMemPrep) //new cache block, prepare memory
 			{
@@ -442,7 +461,7 @@ u32 PADRead(u32 calledByGame)
 		{
 			if (chan == HID_CTRL->MultiInValue) break; // MultiInValue defines how many controllers we are expecting
 
-			HID_Packet = (vu8*)(0x930050F0 + (chan * 32));	//skip forward how ever many bytes in each controller
+			HID_Packet = (vu8*)(HIDBase + (chan * 32));	//skip forward how ever many bytes in each controller
 			u32 HID_CacheEndBlock = ALIGN32(((u32)HID_Packet) + 32); //calculate upper cache block used
 			if(HID_CacheEndBlock > HIDMemPrep) //new cache block, prepare memory
 			{
@@ -830,6 +849,7 @@ u32 PADRead(u32 calledByGame)
 			else
 				Pad[chan].triggerRight = 0;
 		}
+	}
 	}
 
 	if(MaxPads == 0) //wiiu
