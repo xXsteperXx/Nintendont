@@ -235,8 +235,13 @@ DRESULT disk_shutdown (BYTE pdrv)
 {
 	if (/*pdrv < DEV_SD ||*/ pdrv > DEV_USB)
 		return RES_PARERR;
-	if (!disk_isInit[pdrv])
+	if (!disk_isInit[pdrv]) {
+		// A failed USB startup (no drive plugged in) still opened /dev/usb/ven.
+		// Release it, otherwise the kernel can never open it for XInput pads.
+		if (pdrv == DEV_USB)
+			USB_OGC_Deinitialize();
 		return RES_OK;
+	}
 
 	if (cache[pdrv]) {
 		// Flush and destroy the cache.
