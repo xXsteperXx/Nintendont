@@ -582,11 +582,6 @@ WaitForExit:
 	else
 	{
 		dbgprintf("Kernel done, waiting for IOS Reload\n");
-		//diagnostic: the disc slot light turns on when the kernel finished its part of the exit
-		set32(HW_GPIO_ENABLE, GPIO_SLOT_LED);
-		clear32(HW_GPIO_DIR, GPIO_SLOT_LED);
-		clear32(HW_GPIO_OWNER, GPIO_SLOT_LED);
-		set32(HW_GPIO_OUT, GPIO_SLOT_LED);
 		write32(RESET_STATUS, 0);
 		sync_after_write((void*)RESET_STATUS, 0x20);
 	}
