@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v11: 2 USB controllers at the same time (Player 1 + Player 2)
+// v12: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -351,9 +351,11 @@ static u32 VenDisabled = 0, VenOpenTries = 0, VenOpenTimer = 0, VenWaitTimer = 0
 static usb_device_entry VenDevices[32] ALIGNED(32);
 static struct _usb_msg_a VenReadReq[HID_MAX_SLOTS] ALIGNED(32);
 struct _usb_msg ven_write_req ALIGNED(32);
-static struct ipcmessage *venchangemsg = NULL, *venattachmsg = NULL, *venoutmsg = NULL;
-static vu32 venchange = 0, venattach = 0, venoutbusy = 0;
-static u8 *VenOutBuf = NULL;
+static struct ipcmessage *venchangemsg = NULL, *venattachmsg = NULL, *venoutmsg = NULL, *venctrlmsg = NULL;
+static vu32 venchange = 0, venattach = 0, venoutbusy = 0, venctrlbusy = 0, venctrldone = 0;
+static volatile s32 VenCtrlRet = 0;
+static u8 *VenOutBuf = NULL, *VenCtrlBuf = NULL;
+struct _usb_msg ven_ctrl_req ALIGNED(32);
 
 // devices whose buttons only come through /dev/usb/ven
 static const u16 VenOnlyIDs[][2] =
@@ -434,7 +436,7 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v10 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v12 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -1020,9 +1022,16 @@ static u32 HIDAlarm()
 				slot = i+1;
 			}
 		}
+		if(msg == venctrlmsg)
+			VenCtrlRet = (s32)msg->result;
 		mqueue_ack(msg, 0);
 		if(slot)
 			Slots[slot-1].ReadDone = 1;
+		else if(msg == venctrlmsg)
+		{
+			venctrlbusy = 0;
+			venctrldone = 1;
+		}
 		else if(msg == venoutmsg)
 			venoutbusy = 0;
 		else if(msg == venchangemsg)
@@ -1244,6 +1253,35 @@ static s32 VenCancelEndpoint(u32 DeviceID, u32 Endpoint)
 	return ret;
 }
 
+// Linux xpad: "Some third-party Xbox 360-style controllers require this
+// message to finish initialization." Vendor IN request 0x01, wValue 0x0100,
+// 20 bytes. Without it the GameSir dongle resets itself every few seconds.
+static void VenMagic(u32 DeviceID, u32 Iface)
+{
+	struct _usb_msg *msg = &ven_ctrl_req;
+	if(VenCtrlBuf == NULL || venctrlbusy)
+		return;
+	memset32(VenCtrlBuf, 0, 32);
+	sync_after_write(VenCtrlBuf, 32);
+	memset32(msg, 0, sizeof(struct _usb_msg));
+	msg->fd = DeviceID;
+	msg->ctrl.bmRequestType = 0xC1;	//device to host, vendor, interface
+	msg->ctrl.bmRequest = 0x01;
+	msg->ctrl.wValue = 0x0100;
+	msg->ctrl.wIndex = Iface;
+	msg->ctrl.wLength = 20;
+	msg->ctrl.rpData = VenCtrlBuf;
+	msg->vec[0].data = msg;
+	msg->vec[0].len = 64;
+	msg->vec[1].data = VenCtrlBuf;
+	msg->vec[1].len = 20;
+	venctrlbusy = 1;
+	s32 r = IOS_IoctlvAsync(VenHandle, ControlMessage, 1, 1, msg->vec, hidqueue, venctrlmsg);
+	if(r < 0)
+		venctrlbusy = 0;
+	dbgprintf("VEN:magic submit ret=%d\r\n", r);
+}
+
 static u32 VenOpen(void)
 {
 	u32 i, j, e, opened = 0;
@@ -1353,6 +1391,8 @@ static u32 VenOpen(void)
 		r = VenCancelEndpoint(id, EpIn);
 		dbgprintf("VEN:cancel ret=%d\r\n", r);
 
+		VenMagic(id, Heap[54]);
+
 		if(!SlotOpen(FreeSlot, 0, id, vid, pid, EpIn, EpOut, Size, 1))
 			continue;
 
@@ -1450,7 +1490,9 @@ static void VenUpdate(u32 LoaderRequest)
 			venchangemsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 			venattachmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 			venoutmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
+			venctrlmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 			VenOutBuf = (u8*)malloca(32, 32);
+			VenCtrlBuf = (u8*)malloca(32, 32);
 		}
 		VenRearm();
 		return;
@@ -1461,9 +1503,17 @@ static void VenUpdate(u32 LoaderRequest)
 		venchange = 0;
 		IOS_IoctlAsync(VenHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, venattachmsg);
 	}
+	if(venctrldone)
+	{
+		venctrldone = 0;
+		sync_before_read(VenCtrlBuf, 32);
+		dbgprintf("VEN:magic ret=%d %02X %02X %02X %02X %02X %02X %02X %02X\r\n", VenCtrlRet,
+			VenCtrlBuf[0], VenCtrlBuf[1], VenCtrlBuf[2], VenCtrlBuf[3],
+			VenCtrlBuf[4], VenCtrlBuf[5], VenCtrlBuf[6], VenCtrlBuf[7]);
+	}
 	if(venattach)
 	{
-		if(VenWaitTimer < 120)
+		if(VenWaitTimer < 10)	//answer the dongle quickly, it resets itself if nobody talks to it
 			VenWaitTimer++;
 		else
 		{
