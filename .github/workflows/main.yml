@@ -11,13 +11,44 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Nintendont must be built with devkitARM r53-1, devkitPPC r35 and libogc 1.8.23
+      # (see the README of FIX94/Nintendont): with newer versions the Wii
+      # freezes when leaving a game. Old versions from the devkitPro archive.
+      - name: Download the old toolchain
+        run: |
+          set -e
+          mkdir -p oldtc dl
+          curl -fL --retry 3 -o dl/devkitPPC.pkg.tar.xz "https://wii.leseratte10.de/devkitPro/devkitPPC/r35/devkitPPC-r35-1-linux.pkg.tar.xz"
+          curl -fL --retry 3 -o dl/devkitARM.pkg.tar.xz "https://wii.leseratte10.de/devkitPro/devkitARM/r53%20%282019-06%29/devkitARM-r53-1-linux.pkg.tar.xz"
+          curl -fL --retry 3 -o dl/libogc.pkg.tar.xz "https://wii.leseratte10.de/devkitPro/libogc/libogc_1.8.23%20%282019-10-02%29/libogc-1.8.23-1-any.pkg.tar.xz"
+          for f in dl/*.pkg.tar.xz; do tar -xJf "$f" -C oldtc; done
+          ls oldtc/opt/devkitpro
+          oldtc/opt/devkitpro/devkitPPC/bin/powerpc-eabi-gcc --version
+          oldtc/opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc --version
+
       - name: Build Nintendont
         run: |
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/work" \
             -w /work \
+            -e DEVKITPRO=/opt/devkitpro \
+            -e DEVKITPPC=/opt/devkitpro/devkitPPC \
+            -e DEVKITARM=/opt/devkitpro/devkitARM \
             devkitpro/devkitppc:20210619 \
-            make
+            bash -c '
+              set -e
+              mkdir -p /tmp/rules/ppc /tmp/rules/arm
+              cp -a /opt/devkitpro/devkitPPC/*_rules /tmp/rules/ppc/ 2>/dev/null || true
+              cp -a /opt/devkitpro/devkitARM/*_rules /tmp/rules/arm/ 2>/dev/null || true
+              rm -rf /opt/devkitpro/devkitPPC /opt/devkitpro/devkitARM /opt/devkitpro/libogc
+              cp -a /work/oldtc/opt/devkitpro/. /opt/devkitpro/
+              cp -n /tmp/rules/ppc/* /opt/devkitpro/devkitPPC/ 2>/dev/null || true
+              cp -n /tmp/rules/arm/* /opt/devkitpro/devkitARM/ 2>/dev/null || true
+              rm -rf /work/oldtc /work/dl
+              /opt/devkitpro/devkitPPC/bin/powerpc-eabi-gcc --version | head -1
+              /opt/devkitpro/devkitARM/bin/arm-none-eabi-gcc --version | head -1
+              make
+            '
 
       - name: Upload boot.dol
         uses: actions/upload-artifact@v4
