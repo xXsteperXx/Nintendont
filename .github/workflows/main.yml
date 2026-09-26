@@ -38,8 +38,9 @@ jobs:
             bash -c '
               set -e
               mkdir -p /tmp/rules/ppc /tmp/rules/arm
-              cp -a /opt/devkitpro/devkitPPC/*_rules /tmp/rules/ppc/ 2>/dev/null || true
-              cp -a /opt/devkitpro/devkitARM/*_rules /tmp/rules/arm/ 2>/dev/null || true
+              cp -a /opt/devkitpro/devkitPPC/*_rules /opt/devkitpro/devkitPPC/base_tools /tmp/rules/ppc/ 2>/dev/null || true
+              cp -a /opt/devkitpro/devkitARM/*_rules /opt/devkitpro/devkitARM/base_tools /tmp/rules/arm/ 2>/dev/null || true
+              ls /tmp/rules/ppc /tmp/rules/arm
               rm -rf /opt/devkitpro/devkitPPC /opt/devkitpro/devkitARM /opt/devkitpro/libogc
               cp -a /work/oldtc/opt/devkitpro/. /opt/devkitpro/
               cp -n /tmp/rules/ppc/* /opt/devkitpro/devkitPPC/ 2>/dev/null || true
