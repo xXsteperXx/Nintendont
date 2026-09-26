@@ -59,6 +59,9 @@ es_launchtitle(u64 titleID)
 	return ret;
 }
 #define SYSTEM_MENU			0x0000000100000002ULL
+#define HBC_LULZ			0x000100014C554C5AULL //Homebrew Channel 1.1.x
+#define HBC_HAXX			0x0001000148415858ULL //Homebrew Channel 1.0.x
+#define HBC_JODI			0x000100014A4F4449ULL //older Homebrew Channel
 void
 _main(void)
 {
@@ -90,6 +93,11 @@ _main(void)
 #if DEBUG
 	usbgecko_printf("es_init()\n");
 #endif
+	//no loader stub (opened by USB Loader GX etc.): go back to the
+	//Homebrew Channel, the Wii Menu only if it is not installed
+	es_launchtitle(HBC_LULZ);
+	es_launchtitle(HBC_HAXX);
+	es_launchtitle(HBC_JODI);
 	es_launchtitle(SYSTEM_MENU);
 #if DEBUG
 	usbgecko_printf("es_launchtitle()\n");
@@ -115,4 +123,3 @@ __init_syscall()
 	sync_after_write(SYSCALL_VECTOR, 0x100);
 	ICInvalidateRange(SYSCALL_VECTOR, 0x100);
 }
-
