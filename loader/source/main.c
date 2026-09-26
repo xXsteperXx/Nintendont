@@ -1550,7 +1550,13 @@ int main(int argc, char **argv)
 	DCFlushRange((void*)0x93006000, 0xA000);
 
 	DCInvalidateRange((void*)0x93010010, 0x10000);
-	memcpy((void*)0x93010010, loader_stub, 0x1800);
+	//Opened by another loader (USB Loader GX etc.): its return stub froze the Wii,
+	//so leave it out and let the reset stub go back to the Homebrew Channel.
+	//Opened from the Homebrew Channel: keep its stub (that exit works).
+	if(argsboot)
+		memset((void*)0x93010010, 0, 0x1800);
+	else
+		memcpy((void*)0x93010010, loader_stub, 0x1800);
 	memcpy((void*)0x93011810, stub_bin, stub_bin_size);
 	DCFlushRange((void*)0x93010010, 0x10000);
 
