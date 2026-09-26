@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v14: 2 USB controllers at the same time (Player 1 + Player 2)
+// v15: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -82,6 +82,8 @@ typedef struct
 	u32 VenResubmit;
 	u32 VenTimer;
 	u32 VenErrors;
+	u32 VenLive;		// a real report arrived, only then the game sees this pad
+	u32 VenWaitLog;
 	SlotReadFunc Read;
 	u8 *Packet;			// buffer used by IOS
 	controller *Ctrl;	// config read by PADReadGC
@@ -355,7 +357,9 @@ static struct _usb_msg_a VenReadReq[HID_MAX_SLOTS] ALIGNED(32);
 struct _usb_msg ven_write_req ALIGNED(32);
 struct _usb_msg ven_write_req2 ALIGNED(32);
 static struct ipcmessage *venout2msg = NULL;
-static vu32 venout2busy = 0;
+static vu32 venout2busy = 0, venoutdone = 0, venout2done = 0;
+static volatile s32 VenOutRet = 0, VenOut2Ret = 0;
+static u32 VenOutLogs = 0;
 static u8 *VenOutBuf2 = NULL;
 static struct ipcmessage *venchangemsg = NULL, *venattachmsg = NULL, *venoutmsg = NULL, *venctrlmsg = NULL;
 static vu32 venchange = 0, venattach = 0, venoutbusy = 0, venctrlbusy = 0, venctrldone = 0;
@@ -403,9 +407,11 @@ static s32 VenTransfer(hid_slot *s, u8 *Data, u32 Length, u32 Endpoint, struct i
 
 static void PublishStatus(void)
 {
-	write32(HID_STATUS, Slots[0].Active ? 1 : 0);
+	u32 a0 = Slots[0].Active && (!Slots[0].IsVen || Slots[0].VenLive);
+	u32 a1 = Slots[1].Active && (!Slots[1].IsVen || Slots[1].VenLive);
+	write32(HID_STATUS, a0 ? 1 : 0);
 	sync_after_write((void*)HID_STATUS, 0x20);
-	write32(HID_STATUS2, Slots[1].Active ? 1 : 0);
+	write32(HID_STATUS2, a1 ? 1 : 0);
 	sync_after_write((void*)HID_STATUS2, 0x20);
 }
 
@@ -436,13 +442,15 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	s->IsVen = IsVen;
 	s->VenResubmit = 0;
 	s->VenErrors = 0;
+	s->VenLive = 0;
+	s->VenWaitLog = 0;
 	s->VenTimer = read32(HW_TIMER);
 
 	u32 canRumble = (RumbleSlot < 0);
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v14 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v15 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -869,8 +877,13 @@ s32 HIDOpen( u32 LoaderRequest )
 			continue;
 		if(IsVenOnly(AttachedDevices[i].vid, AttachedDevices[i].pid))
 		{
-			dbgprintf("HID:%04X:%04X is read through /dev/usb/ven, skipped here\r\n",
-				AttachedDevices[i].vid, AttachedDevices[i].pid);
+			//only wake it up (a suspended interface may keep the whole dongle asleep)
+			memset32(io_buffer, 0, 0x20);
+			io_buffer[0] = DeviceID;
+			io_buffer[2] = 1;
+			s32 rr = IOS_Ioctl(HIDHandle, ResumeDevice, io_buffer, 0x20, NULL, 0);
+			dbgprintf("HID:%04X:%04X read through /dev/usb/ven, resumed here ret=%d\r\n",
+				AttachedDevices[i].vid, AttachedDevices[i].pid, rr);
 			continue;
 		}
 
@@ -1030,6 +1043,10 @@ static u32 HIDAlarm()
 		}
 		if(msg == venctrlmsg)
 			VenCtrlRet = (s32)msg->result;
+		if(msg == venoutmsg)
+			VenOutRet = (s32)msg->result;
+		if(msg == venout2msg)
+			VenOut2Ret = (s32)msg->result;
 		mqueue_ack(msg, 0);
 		if(slot)
 			Slots[slot-1].ReadDone = 1;
@@ -1040,9 +1057,15 @@ static u32 HIDAlarm()
 			venctrldone = 1;
 		}
 		else if(msg == venoutmsg)
+		{
 			venoutbusy = 0;
+			venoutdone = 1;
+		}
 		else if(msg == venout2msg)
+		{
 			venout2busy = 0;
+			venout2done = 1;
+		}
 		else if(msg == venchangemsg)
 			venchange = 1;
 		else if(msg == venattachmsg)
@@ -1374,11 +1397,17 @@ static u32 VenOpen(void)
 		r = IOS_Ioctl(VenHandle, VEN_ATTACH, io, 0x20, NULL, 0);
 		dbgprintf("VEN:attach ret=%d\r\n", r);
 
-		memset32(io, 0, 0x20);
-		io[0] = id;
-		io[2] = 1; //resume
-		r = IOS_Ioctl(VenHandle, ResumeDevice, io, 0x20, NULL, 0);
-		dbgprintf("VEN:resume ret=%d\r\n", r);
+		for(e = 0; e < 5; ++e)
+		{
+			memset32(io, 0, 0x20);
+			io[0] = id;
+			io[2] = 1; //resume
+			r = IOS_Ioctl(VenHandle, ResumeDevice, io, 0x20, NULL, 0);
+			dbgprintf("VEN:resume ret=%d\r\n", r);
+			if(r >= 0)
+				break;
+			mdelay(5);
+		}
 
 		memset32(Heap, 0, 0xC0);
 		memset32(io, 0, 0x20);
@@ -1427,6 +1456,13 @@ static u32 VenOpen(void)
 		dbgprintf("VEN:ep in %02X out %02X size %u\r\n", EpIn, EpOut, Size);
 		if(!EpIn || Size < VEN_REPORT_SIZE)
 			continue;
+
+		// claim interface 0, alt setting 0 (like the first transfer does in IOS)
+		memset32(io, 0, 0x20);
+		io[0] = id;
+		io[2] = 0;
+		r = IOS_Ioctl(VenHandle, 7, io, 0x20, NULL, 0);
+		dbgprintf("VEN:setalt ret=%d\r\n", r);
 
 		// no SET_CONFIGURATION (IOS already did it), just reset the endpoint state
 		r = VenCancelEndpoint(id, EpIn);
@@ -1519,6 +1555,12 @@ static void SlotVenRead(u32 idx)
 		s16 rx = (s16)(P[10] | (P[11] << 8));
 		s16 ry = (s16)(P[12] | (P[13] << 8));
 		s->VenErrors = 0;
+		if(!s->VenLive)
+		{
+			s->VenLive = 1;
+			dbgprintf("VEN:t=%u slot %u FIRST REPORT, pad is live\r\n", TMS(), idx);
+			PublishStatus();
+		}
 		// bytes 0-5 as sent (buttons, triggers), 6-9 sticks as 8 bit
 		memcpy(cooked, P, VEN_REPORT_SIZE);
 		cooked[6] = VenAxis(lx);
@@ -1580,7 +1622,29 @@ static void VenUpdate(u32 LoaderRequest)
 		venchange = 0;
 		IOS_IoctlAsync(VenHandle, AttachFinish, NULL, 0, NULL, 0, hidqueue, venattachmsg);
 	}
+	if(venoutdone)
+	{
+		venoutdone = 0;
+		if(VenOutLogs++ < 8)
+			dbgprintf("VEN:t=%u out done ret=%d\r\n", TMS(), VenOutRet);
+	}
+	if(venout2done)
+	{
+		venout2done = 0;
+		dbgprintf("VEN:t=%u out2 done ret=%d\r\n", TMS(), VenOut2Ret);
+	}
 	VenPumpOut();
+	for(i = 0; i < HID_MAX_SLOTS; ++i)
+	{
+		hid_slot *w = &Slots[i];
+		if(w->Active && w->IsVen && !w->VenLive && w->ReadPending && w->VenWaitLog < 5 &&
+			TimerDiffTicks(w->VenTimer) > 3800000)	// every 2 seconds
+		{
+			w->VenWaitLog++;
+			w->VenTimer = read32(HW_TIMER);
+			dbgprintf("VEN:t=%u slot %u still waiting for the first report\r\n", TMS(), i);
+		}
+	}
 	if(venattach)
 	{
 		if(VenWaitTimer < 10)	//answer the dongle quickly, it resets itself if nobody talks to it
