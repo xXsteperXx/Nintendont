@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v12: 2 USB controllers at the same time (Player 1 + Player 2)
+// v13: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -56,6 +56,16 @@ static const u8 ss_led_pattern[8] = {0x0, 0x02, 0x04, 0x08, 0x10, 0x12, 0x14, 0x
 
 #define HID_MAX_SLOTS	2
 #define HID_PACKET_BUF	128
+#define TMS()	(read32(HW_TIMER) / 1898)	// milliseconds, for the log
+
+// "companion": the extra HID interface of the GameSir dongle (not a player),
+// polled like Windows does, only to keep the dongle happy and log its data
+static u32 CompID = 0, CompLen = 0, CompPending = 0, CompReads = 0, CompErrors = 0;
+static vu32 compdone = 0;
+static volatile s32 CompRet = 0;
+static struct ipcmessage *compmsg = NULL;
+static u8 *CompBuf = NULL;
+struct _usb_msg comp_irq_req ALIGNED(32);
 
 typedef void (*SlotReadFunc)(u32 idx);
 
@@ -161,6 +171,8 @@ void HIDInit( void )
 	kbbuf = (u8*)malloca( 32,32 );
 	DS4Big = (u8*)malloca( 544, 32 );
 	DS4Feat = (u8*)malloca( 64, 32 );
+	CompBuf = (u8*)malloca( 64, 32 );
+	compmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
 
 	u32 i;
 	memset32(Slots, 0, sizeof(Slots));
@@ -436,7 +448,7 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v12 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v13 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -809,10 +821,68 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	return 1;
 }
 
+static void CompSubmit(void)
+{
+	struct _usb_msg *msg = &comp_irq_req;
+	memset32(msg, 0, sizeof(struct _usb_msg));
+	msg->fd = CompID;
+	msg->hid_intr_dir = 0; //IN
+	msg->vec[0].data = msg;
+	msg->vec[0].len = 64;
+	msg->vec[1].data = CompBuf;
+	msg->vec[1].len = CompLen;
+	CompPending = 1;
+	if(IOS_IoctlvAsync(HIDHandle, InterruptMessage, 1, 1, msg->vec, hidqueue, compmsg) < 0)
+		CompPending = 0;
+}
+
+static void CompOpen(u32 DeviceID, u32 Iface, u32 MaxPacket)
+{
+	hid_slot tmp;
+	s32 r;
+	memset32(&tmp, 0, sizeof(tmp));
+	tmp.DeviceID = DeviceID;
+	dbgprintf("COMP:open t=%u id=%u iface=%u size=%u\r\n", TMS(), DeviceID, Iface, MaxPacket);
+	//like Windows: read the report descriptor and set idle
+	memset32(DS4Big, 0, 544);
+	r = SlotCtrlSync(&tmp, Iface, 0x81, 0x06, 0x2200, 64, DS4Big);
+	dbgprintf("COMP:desc ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n", r,
+		DS4Big[0], DS4Big[1], DS4Big[2], DS4Big[3], DS4Big[4], DS4Big[5],
+		DS4Big[6], DS4Big[7], DS4Big[8], DS4Big[9], DS4Big[10], DS4Big[11]);
+	r = SlotCtrlSync(&tmp, Iface, 0x21, 0x0A, 0x0000, 0, DS4Big);
+	dbgprintf("COMP:setidle ret=%d\r\n", r);
+	CompID = DeviceID;
+	CompLen = (MaxPacket == 0 || MaxPacket > 64) ? 64 : MaxPacket;
+	CompReads = 0;
+	CompErrors = 0;
+	if(!CompPending)
+		CompSubmit();
+}
+
+static void CompRead(void)
+{
+	CompPending = 0;
+	sync_before_read(CompBuf, 64);
+	CompReads++;
+	if(CompReads <= 10)
+		dbgprintf("COMP:read t=%u n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+			TMS(), CompReads, CompRet, CompBuf[0], CompBuf[1], CompBuf[2], CompBuf[3], CompBuf[4],
+			CompBuf[5], CompBuf[6], CompBuf[7], CompBuf[8], CompBuf[9], CompBuf[10], CompBuf[11]);
+	if(CompRet < 0)
+	{
+		if(++CompErrors > 50)
+			CompID = 0;
+	}
+	else
+		CompErrors = 0;
+	if(CompID)
+		CompSubmit();
+}
+
 s32 HIDOpen( u32 LoaderRequest )
 {
 	u32 i, j;
-	dbgprintf("HIDOpen()\r\n");
+	dbgprintf("HIDOpen() t=%u\r\n", TMS());
 
 	memset32((void*)HID_STATUS, 0, 0x20);
 	sync_after_write((void*)HID_STATUS, 0x20);
@@ -821,7 +891,7 @@ s32 HIDOpen( u32 LoaderRequest )
 
 	//1. free slots of devices that are gone
 	u32 Present[HID_MAX_SLOTS];
-	u32 KBPresent = 0;
+	u32 KBPresent = 0, CompPresent = 0;
 	for(j = 0; j < HID_MAX_SLOTS; ++j)
 		Present[j] = 0;
 	for(i = 0; i < 32; ++i)
@@ -836,7 +906,11 @@ s32 HIDOpen( u32 LoaderRequest )
 		}
 		if(KeyboardID != 0 && id == KeyboardID)
 			KBPresent = 1;
+		if(CompID != 0 && id == CompID)
+			CompPresent = 1;
 	}
+	if(!CompPresent)
+		CompID = 0;
 	for(j = 0; j < HID_MAX_SLOTS; ++j)
 	{
 		if(Slots[j].Active && !Slots[j].IsVen && !Present[j])
@@ -853,7 +927,7 @@ s32 HIDOpen( u32 LoaderRequest )
 		if(AttachedDevices[i].vid == 0)
 			continue;
 		u32 DeviceID = AttachedDevices[i].device_id;
-		u32 InUse = (KeyboardID != 0 && DeviceID == KeyboardID);
+		u32 InUse = (KeyboardID != 0 && DeviceID == KeyboardID) || (CompID != 0 && DeviceID == CompID);
 		for(j = 0; j < HID_MAX_SLOTS; ++j)
 		{
 			if(Slots[j].Active && !Slots[j].IsVen && Slots[j].DeviceID == DeviceID)
@@ -861,12 +935,7 @@ s32 HIDOpen( u32 LoaderRequest )
 		}
 		if(InUse)
 			continue;
-		if(IsVenOnly(AttachedDevices[i].vid, AttachedDevices[i].pid))
-		{
-			dbgprintf("HID:%04X:%04X is read through /dev/usb/ven, skipped here\r\n",
-				AttachedDevices[i].vid, AttachedDevices[i].pid);
-			continue;
-		}
+		u32 VenOnlyDev = IsVenOnly(AttachedDevices[i].vid, AttachedDevices[i].pid);
 
 		s32 FreeSlot = -1;
 		for(j = 0; j < HID_MAX_SLOTS; ++j)
@@ -907,6 +976,7 @@ s32 HIDOpen( u32 LoaderRequest )
 		Offset += (ConfigurationLength+3)&(~3);
 
 		u32 InterfaceDescLength = *(vu8*)(HIDHeap+Offset);
+		u32 bInterfaceNumber = *(vu8*)(HIDHeap+Offset+2);
 
 		u32 bInterfaceClass = *(vu8*)(HIDHeap+Offset+5);
 		u32 bInterfaceSubClass = *(vu8*)(HIDHeap+Offset+6);
@@ -946,6 +1016,12 @@ s32 HIDOpen( u32 LoaderRequest )
 			bEndpointAddressKeyboard = bEndpointAddress;
 			//set to boot protocol (0)
 			HIDControlMessage(NULL, NULL, 0, USB_REQTYPE_INTERFACE_SET, USB_REQ_SETPROTOCOL, 0, 0, NULL);
+		}
+		else if(VenOnlyDev)
+		{
+			//its buttons come through /dev/usb/ven, only keep this interface busy
+			if(CompID == 0 && bInterfaceProtocol != USB_PROTOCOL_MOUSE)
+				CompOpen(DeviceID, bInterfaceNumber, wMaxPacketSize);
 		}
 		else if(FreeSlot >= 0 &&
 			(bInterfaceProtocol != USB_PROTOCOL_KEYBOARD) &&
@@ -1024,9 +1100,13 @@ static u32 HIDAlarm()
 		}
 		if(msg == venctrlmsg)
 			VenCtrlRet = (s32)msg->result;
+		if(msg == compmsg)
+			CompRet = (s32)msg->result;
 		mqueue_ack(msg, 0);
 		if(slot)
 			Slots[slot-1].ReadDone = 1;
+		else if(msg == compmsg)
+			compdone = 1;
 		else if(msg == venctrlmsg)
 		{
 			venctrlbusy = 0;
@@ -1299,7 +1379,7 @@ static u32 VenOpen(void)
 		if(VenLogged < 16)
 		{
 			VenLogged++;
-			dbgprintf("VEN:device %u VID:%04X PID:%04X token:%08X\r\n", id, vid, pid, VenDevices[i].token);
+			dbgprintf("VEN:device t=%u id=%u VID:%04X PID:%04X token:%08X\r\n", TMS(), id, vid, pid, VenDevices[i].token);
 		}
 		if(!IsVenOnly(vid, pid))
 			continue;
@@ -1391,6 +1471,18 @@ static u32 VenOpen(void)
 		r = VenCancelEndpoint(id, EpIn);
 		dbgprintf("VEN:cancel ret=%d\r\n", r);
 
+		//start reading right away (like Linux), before the slow .ini load
+		{
+			hid_slot *vs = &Slots[FreeSlot];
+			vs->DeviceID = id;
+			vs->EpIn = EpIn;
+			vs->EpOut = EpOut;
+			vs->MaxPacket = (Size > HID_PACKET_BUF) ? HID_PACKET_BUF : Size;
+			vs->IsVen = 1;
+			vs->Reads = 0;
+			if(!vs->ReadPending)
+				SlotSubmitRead(FreeSlot);
+		}
 		VenMagic(id, Heap[54]);
 
 		if(!SlotOpen(FreeSlot, 0, id, vid, pid, EpIn, EpOut, Size, 1))
@@ -1421,8 +1513,8 @@ static void SlotVenRead(u32 idx)
 	sync_before_read(P, HID_PACKET_BUF);
 	s->Reads++;
 	if(s->Reads <= 5 || (ret < 0 && s->VenErrors < 3))
-		dbgprintf("VEN:slot %u read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
-			idx, s->Reads, ret, P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7],
+		dbgprintf("VEN:t=%u slot %u read n=%u ret=%d %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\r\n",
+			TMS(), idx, s->Reads, ret, P[0], P[1], P[2], P[3], P[4], P[5], P[6], P[7],
 			P[8], P[9], P[10], P[11], P[12], P[13]);
 
 	if(ret < 0)
@@ -1507,7 +1599,7 @@ static void VenUpdate(u32 LoaderRequest)
 	{
 		venctrldone = 0;
 		sync_before_read(VenCtrlBuf, 32);
-		dbgprintf("VEN:magic ret=%d %02X %02X %02X %02X %02X %02X %02X %02X\r\n", VenCtrlRet,
+		dbgprintf("VEN:t=%u magic ret=%d %02X %02X %02X %02X %02X %02X %02X %02X\r\n", TMS(), VenCtrlRet,
 			VenCtrlBuf[0], VenCtrlBuf[1], VenCtrlBuf[2], VenCtrlBuf[3],
 			VenCtrlBuf[4], VenCtrlBuf[5], VenCtrlBuf[6], VenCtrlBuf[7]);
 	}
@@ -1794,6 +1886,11 @@ void HIDUpdateRegisters(u32 LoaderRequest)
 			IOS_IoctlAsync(HIDHandle, GetDeviceChange, NULL, 0, AttachedDevices, 0x180, hidqueue, hidchangemsg);
 		}
 		VenUpdate(LoaderRequest);
+		if(compdone)
+		{
+			compdone = 0;
+			CompRead();
+		}
 		for(i = 0; i < HID_MAX_SLOTS; ++i)
 		{
 			if(Slots[i].ReadDone == 1 && (hidattached || Slots[i].IsVen))
