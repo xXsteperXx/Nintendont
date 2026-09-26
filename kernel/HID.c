@@ -28,7 +28,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include <stdlib.h>
 #include "ff_utf8.h"
 
-// v15: 2 USB controllers at the same time (Player 1 + Player 2)
+// v16: 2 USB controllers at the same time (Player 1 + Player 2)
 // + XInput pads through /dev/usb/ven (GameSir Nova Lite dongle 3537:1040), SD only
 // DS4 v2 (054C:09CC, interface 3) + 8BitDo Ultimate 2 dock (2DC8:6012)
 extern int dbgprintf( const char *fmt, ...);
@@ -84,6 +84,9 @@ typedef struct
 	u32 VenErrors;
 	u32 VenLive;		// a real report arrived, only then the game sees this pad
 	u32 VenWaitLog;
+	u32 VenStage;		// recovery step tried while no report arrives
+	u32 VenStageTimer;
+	u32 VenHold;		// no new read while a recovery step runs
 	SlotReadFunc Read;
 	u8 *Packet;			// buffer used by IOS
 	controller *Ctrl;	// config read by PADReadGC
@@ -444,13 +447,16 @@ static u32 SlotOpen(u32 idx, u32 LoaderRequest, u32 DeviceID, u32 DeviceVID, u32
 	s->VenErrors = 0;
 	s->VenLive = 0;
 	s->VenWaitLog = 0;
+	s->VenStage = 0;
+	s->VenHold = 0;
+	s->VenStageTimer = read32(HW_TIMER);
 	s->VenTimer = read32(HW_TIMER);
 
 	u32 canRumble = (RumbleSlot < 0);
 	u32 slotRumble = 0;
 	RumbleFunc rfunc = NULL;
 
-	dbgprintf("HID:v15 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
+	dbgprintf("HID:v16 slot %u VID:%04X PID:%04X ep=%02X epout=%02X size=%u\r\n",
 		idx, DeviceVID, DevicePID, EpIn, EpOut, MaxPacket);
 
 	if(IsVen)
@@ -1346,6 +1352,78 @@ static void VenQueueOut(hid_slot *s, u8 a, u8 b, u8 c)
 	VenPumpOut();
 }
 
+// the Windows start sequence: product string, 3 vendor requests,
+// then 01 03 02 and 02 08 03 on the OUT endpoint
+static void VenStartSeq(hid_slot *vs)
+{
+	s32 r;
+	u32 id = vs->DeviceID;
+	VenCtrlSync(id, 0x80, 0x06, 0x0302, 0x0409, 4);
+	VenCtrlSync(id, 0x80, 0x06, 0x0302, 0x0409, 42);
+	VenCtrlSync(id, 0xC1, 0x01, 0x0100, 0x0000, 20);
+	VenCtrlSync(id, 0xC1, 0x01, 0x0000, 0x0000, 8);
+	VenCtrlSync(id, 0xC0, 0x01, 0x0000, 0x0000, 4);
+	VenOutQn = VenOutQpos = 0;
+	VenOutSlot = vs;
+	VenQueueOut(vs, 0x01, 0x03, 0x02);
+	//second command at the same time, like Windows
+	if(vs->EpOut && !venout2busy && VenOutBuf2 != NULL)
+	{
+		memset32(VenOutBuf2, 0, 32);
+		VenOutBuf2[0] = 0x02;
+		VenOutBuf2[1] = 0x08;
+		VenOutBuf2[2] = 0x03;
+		venout2busy = 1;
+		r = VenTransfer(vs, VenOutBuf2, 3, vs->EpOut, venout2msg);
+		if(r < 0)
+			venout2busy = 0;
+		dbgprintf("VEN:t=%u out 02 08 03 ret=%d\r\n", TMS(), r);
+	}
+}
+
+// Recovery steps, tried one after the other (3 s apart) while no report arrives.
+// The log shows which one (if any) makes the reports start.
+static void VenRecoveryStep(hid_slot *s)
+{
+	s32 r;
+	u32 id = s->DeviceID;
+	switch(s->VenStage)
+	{
+		case 1:	// clear a possible halt on the IN endpoint
+			dbgprintf("VEN:t=%u STEP 1: clear halt on IN\r\n", TMS());
+			VenCtrlSync(id, 0x02, 0x01, 0x0000, s->EpIn, 0);
+			r = VenCancelEndpoint(id, s->EpIn);
+			dbgprintf("VEN:cancel in ret=%d\r\n", r);
+			break;
+		case 2:	// same order as Windows: SET_CONFIGURATION first, then the start sequence
+			dbgprintf("VEN:t=%u STEP 2: set configuration + start sequence\r\n", TMS());
+			VenCtrlSync(id, 0x00, 0x09, 0x0001, 0x0000, 0);
+			r = VenCancelEndpoint(id, s->EpIn);
+			dbgprintf("VEN:cancel in ret=%d\r\n", r);
+			if(s->EpOut)
+			{
+				r = VenCancelEndpoint(id, s->EpOut);
+				dbgprintf("VEN:cancel out ret=%d\r\n", r);
+			}
+			VenStartSeq(s);
+			break;
+		case 3:	// SET_INTERFACE 0/0 + start sequence
+			dbgprintf("VEN:t=%u STEP 3: set interface + start sequence\r\n", TMS());
+			VenCtrlSync(id, 0x01, 0x0B, 0x0000, 0x0000, 0);
+			r = VenCancelEndpoint(id, s->EpIn);
+			dbgprintf("VEN:cancel in ret=%d\r\n", r);
+			if(s->EpOut)
+			{
+				r = VenCancelEndpoint(id, s->EpOut);
+				dbgprintf("VEN:cancel out ret=%d\r\n", r);
+			}
+			VenStartSeq(s);
+			break;
+		default:
+			break;
+	}
+}
+
 static u32 VenOpen(void)
 {
 	u32 i, j, e, opened = 0;
@@ -1471,11 +1549,6 @@ static u32 VenOpen(void)
 		//same start sequence as Windows (from a USB capture of this dongle):
 		//product string, 3 vendor requests, then 01 03 02 and 02 08 03 on
 		//the OUT endpoint, then keep an IN read waiting
-		VenCtrlSync(id, 0x80, 0x06, 0x0302, 0x0409, 4);
-		VenCtrlSync(id, 0x80, 0x06, 0x0302, 0x0409, 42);
-		VenCtrlSync(id, 0xC1, 0x01, 0x0100, 0x0000, 20);
-		VenCtrlSync(id, 0xC1, 0x01, 0x0000, 0x0000, 8);
-		VenCtrlSync(id, 0xC0, 0x01, 0x0000, 0x0000, 4);
 		{
 			hid_slot *vs = &Slots[FreeSlot];
 			vs->DeviceID = id;
@@ -1484,22 +1557,7 @@ static u32 VenOpen(void)
 			vs->MaxPacket = (Size > HID_PACKET_BUF) ? HID_PACKET_BUF : Size;
 			vs->IsVen = 1;
 			vs->Reads = 0;
-			VenOutQn = VenOutQpos = 0;
-			VenOutSlot = vs;
-			VenQueueOut(vs, 0x01, 0x03, 0x02);
-			//second command at the same time, like Windows
-			if(EpOut && !venout2busy && VenOutBuf2 != NULL)
-			{
-				memset32(VenOutBuf2, 0, 32);
-				VenOutBuf2[0] = 0x02;
-				VenOutBuf2[1] = 0x08;
-				VenOutBuf2[2] = 0x03;
-				venout2busy = 1;
-				r = VenTransfer(vs, VenOutBuf2, 3, EpOut, venout2msg);
-				if(r < 0)
-					venout2busy = 0;
-				dbgprintf("VEN:t=%u out 02 08 03 ret=%d\r\n", TMS(), r);
-			}
+			VenStartSeq(vs);
 			if(!vs->ReadPending)
 				SlotSubmitRead(FreeSlot);
 		}
@@ -1644,6 +1702,32 @@ static void VenUpdate(u32 LoaderRequest)
 			w->VenTimer = read32(HW_TIMER);
 			dbgprintf("VEN:t=%u slot %u still waiting for the first report\r\n", TMS(), i);
 		}
+		if(w->Active && w->IsVen && !w->VenLive)
+		{
+			if(w->VenHold)
+			{
+				// wait until the cancelled read came back (at most 1 s)
+				if(!w->ReadPending || TimerDiffTicks(w->VenStageTimer) > 1900000)
+				{
+					if(w->ReadPending)
+						dbgprintf("VEN:t=%u read still pending, going on\r\n", TMS());
+					VenRecoveryStep(w);
+					w->VenHold = 0;
+					w->VenResubmit = 1;
+					w->VenErrors = 0;
+					w->VenTimer = read32(HW_TIMER);
+					w->VenStageTimer = read32(HW_TIMER);
+				}
+			}
+			else if(w->VenStage < 3 && TimerDiffTicks(w->VenStageTimer) > 5700000)	// 3 seconds
+			{
+				w->VenStage++;
+				w->VenHold = 1;
+				w->VenStageTimer = read32(HW_TIMER);
+				if(w->ReadPending)
+					VenCancelEndpoint(w->DeviceID, w->EpIn);	// makes the waiting read return
+			}
+		}
 	}
 	if(venattach)
 	{
@@ -1660,7 +1744,7 @@ static void VenUpdate(u32 LoaderRequest)
 	for(i = 0; i < HID_MAX_SLOTS; ++i)
 	{
 		hid_slot *s = &Slots[i];
-		if(s->Active && s->IsVen && s->VenResubmit && !s->ReadPending &&
+		if(s->Active && s->IsVen && s->VenResubmit && !s->ReadPending && !s->VenHold &&
 			TimerDiffTicks(s->VenTimer) > VEN_POLL_TICKS)
 		{
 			s->VenResubmit = 0;
