@@ -1550,9 +1550,7 @@ int main(int argc, char **argv)
 	DCFlushRange((void*)0x93006000, 0xA000);
 
 	DCInvalidateRange((void*)0x93010010, 0x10000);
-	//leaving a game always goes back to the Wii Menu: without the launcher's
-	//stub, Nintendont's own stub reloads the System Menu
-	memset((void*)0x93010010, 0, 0x1800);
+	memcpy((void*)0x93010010, loader_stub, 0x1800);
 	memcpy((void*)0x93011810, stub_bin, stub_bin_size);
 	DCFlushRange((void*)0x93010010, 0x10000);
 
